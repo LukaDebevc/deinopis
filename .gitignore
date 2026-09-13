@@ -1,0 +1,24 @@
+/target
+/data
+*.pgn
+*.epd
+
+# Checkpoint reference binaries, rated opponents, match artefacts (all rebuildable).
+.checkpoints/
+.ladder/
+.sprt/
+
+# Trainer output: checkpoints and nets are regenerable. The shipped net is nets/.
+__pycache__/
+*.pyc
+nnue/ckpt*/
+nnue/nets/
+nnue/extract/target/
+nnue/**/*.npz
+nnue/**/*.npy
+nnue/**/*.pt
+nnue/**/*.bin
+nnue/**/*.log
+nnue/**/*.jsonl
+nnue/**/.venv
+nnue/**/.key*

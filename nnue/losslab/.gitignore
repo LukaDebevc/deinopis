@@ -1,0 +1,9 @@
+.key
+.key-openrouter
+results/
+candidates/
+*.log
+losslab_run.jsonl
+
+# Generated sweep arms: rebuilt from the template + manual.jsonl.
+sweeps/arms/

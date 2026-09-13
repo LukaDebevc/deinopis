@@ -1,0 +1,384 @@
+//! UCI protocol front-end.
+//!
+//! UCI is the reason this is the primary interface rather than a nicety: it is
+//! what every chess GUI speaks, and what cutechess-cli and OpenBench drive to
+//! run SPRT matches. Any change we want to claim is worth Elo has to be
+//! measured through this interface.
+
+use crate::board::{Board, START_FEN};
+use crate::chess_move::Move;
+use crate::qeval::DefaultEval;
+use crate::movegen::{generate, GenType};
+use crate::chess_move::MoveList;
+use crate::search::{go_parallel, score_to_uci, Limits, Params, SearchResult, Shared};
+use std::io::{BufRead, Write};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::thread::JoinHandle;
+
+pub const NAME: &str = "chess";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const AUTHOR: &str = "luka";
+
+pub struct Engine {
+    pub shared: Arc<Shared>,
+    pub board: Board,
+    /// Zobrist keys of every position in the game so far, for repetition
+    /// detection across the root.
+    pub history: Vec<u64>,
+    pub params: Params,
+    pub threads: usize,
+    hash_mb: usize,
+    worker: Option<JoinHandle<()>>,
+    adapt: std::sync::Arc<std::sync::Mutex<crate::adaptive::AdaptiveState>>,
+}
+
+impl Engine {
+    pub fn new() -> Engine {
+        // adaptive::init_from_env already ran via crate::init(), but ensure params captured
+        let params = crate::adaptive::global_handle().lock().map(|g| g.params.clone()).unwrap_or_default();
+        Engine {
+            shared: Arc::new(Shared::new(64)),
+            board: Board::startpos(),
+            history: Vec::new(),
+            params: Params::default(),
+            threads: 1,
+            hash_mb: 64,
+            worker: None,
+            adapt: std::sync::Arc::new(std::sync::Mutex::new(crate::adaptive::AdaptiveState::new(params))),
+        }
+    }
+
+    /// Apply a UCI move string to the current board, returning false if it is
+    /// not legal here. Matching against generated moves is what turns "e1g1"
+    /// into a castling move with the right flags.
+    pub fn apply_uci_move(&mut self, s: &str) -> bool {
+        let mut list = MoveList::new();
+        generate(&self.board, GenType::All, &mut list);
+        if let Some(m) = list.find_uci(s) {
+            self.history.push(self.board.key());
+            self.board = self.board.make_move(m);
+            return true;
+        }
+        false
+    }
+
+    pub fn set_position(&mut self, fen: &str, moves: &[String]) -> Result<(), String> {
+        self.board = Board::from_fen(fen)?;
+        self.history.clear();
+        for m in moves {
+            if !self.apply_uci_move(m) {
+                return Err(format!("illegal move '{m}' in position command"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn stop(&mut self) {
+        self.shared.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
+    }
+
+    /// Run a search on the calling thread and return the result. Used by the
+    /// web GUI and terminal play, where there is nothing to do concurrently.
+    pub fn search_blocking(&self, limits: Limits) -> SearchResult {
+        self.shared.stop.store(false, Ordering::Relaxed);
+        let adapt = self.adapt.clone();
+        go_parallel(
+            &self.shared,
+            &self.board,
+            &self.history,
+            &limits,
+            self.params,
+            self.search_threads(&limits),
+            move || crate::qeval::DefaultEval::with_adaptive(adapt.clone()),
+            None,
+        )
+    }
+
+    /// Start a search on a worker thread, printing UCI `info` lines as it goes
+    /// and `bestmove` at the end. Returns immediately so `stop` can be handled.
+    fn go_async(&mut self, limits: Limits) {
+        self.stop();
+        self.shared.stop.store(false, Ordering::Relaxed);
+        let shared = Arc::clone(&self.shared);
+        let board = self.board;
+        let history = self.history.clone();
+        let params = self.params;
+
+        let threads = self.search_threads(&limits);
+        let adapt = self.adapt.clone();
+
+        self.worker = Some(std::thread::spawn(move || {
+            let mut emit = |r: &SearchResult, el: std::time::Duration, seldepth: usize| {
+                let ms = el.as_millis().max(1) as u64;
+                // Under SMP the played line is thread 0's, but the work done is
+                // every thread's — reporting only thread 0's nodes would
+                // understate nps by a factor of `threads` and make a
+                // `nodes`-based comparison between builds meaningless.
+                let nodes = if threads > 1 {
+                    shared.nodes.load(Ordering::Relaxed).max(r.nodes)
+                } else {
+                    r.nodes
+                };
+                let nps = nodes * 1000 / ms;
+                let pv: Vec<String> = r.pv.iter().map(|m| m.to_uci()).collect();
+                println!(
+                    "info depth {} seldepth {} score {} nodes {} nps {} hashfull {} time {} pv {}",
+                    r.depth,
+                    seldepth,
+                    score_to_uci(r.score),
+                    nodes,
+                    nps,
+                    shared.tt.hashfull(),
+                    ms,
+                    pv.join(" ")
+                );
+                let _ = std::io::stdout().flush();
+            };
+            let res = go_parallel(
+                &shared,
+                &board,
+                &history,
+                &limits,
+                params,
+                threads,
+                move || crate::qeval::DefaultEval::with_adaptive(adapt.clone()),
+                Some(&mut emit),
+            );
+            println!("bestmove {}", res.best_move.to_uci());
+            let _ = std::io::stdout().flush();
+        }));
+    }
+
+    /// How many threads this search may use.
+    ///
+    /// A node-limited search is forced to one thread. `go nodes N` is how the
+    /// tuner and every reproducibility check ask for a fixed unit of work, and
+    /// under Lazy SMP "N nodes" would be N nodes on *some* thread with the
+    /// others racing it — a different search every run. Time-limited searches
+    /// are already nondeterministic, so they lose nothing.
+    fn search_threads(&self, limits: &Limits) -> usize {
+        if limits.nodes.is_some() {
+            1
+        } else {
+            self.threads
+        }
+    }
+
+    fn set_option(&mut self, name: &str, value: &str) {
+        match name.to_ascii_lowercase().as_str() {
+            "hash" => {
+                if let Ok(mb) = value.parse::<usize>() {
+                    self.hash_mb = mb.clamp(1, 65536);
+                    // Rebuilding requires exclusive access, so a fresh Shared is
+                    // simpler and safer than resizing under other threads.
+                    self.shared = Arc::new(Shared::new(self.hash_mb));
+                }
+            }
+            "threads" => {
+                if let Ok(t) = value.parse::<usize>() {
+                    self.threads = t.clamp(1, 256);
+                }
+            }
+            // Percent, because UCI spins are integers. 50 is a normal engine;
+            // 0 makes a draw worth exactly as much as a loss.
+            "drawvalue" => {
+                if let Ok(v) = value.parse::<i64>() {
+                    crate::eval::set_draw_value(v.clamp(0, 100) as f32 / 100.0);
+                }
+            }
+            // Asymmetric contempt as an additive bonus: steepness as a percent
+            // (100 = 1.0), scale in centipawns (0 = off), flat weighting
+            // on/off. See `eval.rs`.
+            "contempta" => {
+                if let Ok(v) = value.parse::<i64>() {
+                    crate::eval::set_contempt_a(v.max(0) as f32 / 100.0);
+                }
+            }
+            "contemptb" => {
+                if let Ok(v) = value.parse::<i64>() {
+                    crate::eval::set_contempt_b(v.max(0) as f32);
+                }
+            }
+            "contemptflat" => {
+                if let Ok(v) = value.parse::<i64>() {
+                    crate::eval::set_contempt_flat(v != 0);
+                }
+            }
+            // Every search constant, by its own name, when the build asks
+            // for it. Behind a feature because a shipped engine has no
+            // business letting an operator move `skip_below`: a tuner is the
+            // only caller that should ever see these, and a parameter set
+            // between games is a version nobody measured.
+            #[cfg(feature = "tune")]
+            other => {
+                if let Ok(v) = value.parse::<i32>() {
+                    // `Params::set` clamps to the declared box, so an
+                    // out-of-range value is corrected rather than obeyed.
+                    let hit = crate::search::Params::all_names()
+                        .iter()
+                        .find(|n| n.eq_ignore_ascii_case(other))
+                        .map(|n| self.params.set(n, v));
+                    if hit != Some(true) {
+                        println!("info string unknown option {other}");
+                    }
+                }
+            }
+            #[cfg(not(feature = "tune"))]
+            _ => {}
+        }
+    }
+}
+
+impl Default for Engine {
+    fn default() -> Engine {
+        Engine::new()
+    }
+}
+
+fn parse_limits(tokens: &[&str]) -> Limits {
+    let mut l = Limits::default();
+    let mut i = 0;
+    let num = |t: Option<&&str>| t.and_then(|s| s.parse::<u64>().ok());
+    while i < tokens.len() {
+        match tokens[i] {
+            "depth" => l.depth = num(tokens.get(i + 1)).map(|v| v as u32),
+            "nodes" => l.nodes = num(tokens.get(i + 1)),
+            "movetime" => l.movetime = num(tokens.get(i + 1)),
+            "wtime" => l.time[0] = num(tokens.get(i + 1)),
+            "btime" => l.time[1] = num(tokens.get(i + 1)),
+            "winc" => l.inc[0] = num(tokens.get(i + 1)).unwrap_or(0),
+            "binc" => l.inc[1] = num(tokens.get(i + 1)).unwrap_or(0),
+            "movestogo" => l.movestogo = num(tokens.get(i + 1)).map(|v| v as u32),
+            "infinite" => l.infinite = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    l
+}
+
+pub fn run() {
+    let mut engine = Engine::new();
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let t: Vec<&str> = line.split_whitespace().collect();
+        if t.is_empty() {
+            continue;
+        }
+        match t[0] {
+            "uci" => {
+                println!("id name {NAME} {VERSION}");
+                println!("id author {AUTHOR}");
+                println!("option name Hash type spin default 64 min 1 max 65536");
+                println!("option name Threads type spin default 1 min 1 max 256");
+                println!(
+                    "option name DrawValue type spin default {} min 0 max 100",
+                    (crate::eval::draw_value() * 100.0).round() as i64
+                );
+                println!(
+                    "option name ContemptA type spin default {} min 0 max 500",
+                    (crate::eval::contempt_a() * 100.0).round() as i64
+                );
+                println!(
+                    "option name ContemptB type spin default {} min 0 max 500",
+                    crate::eval::contempt_b().round() as i64
+                );
+                println!(
+                    "option name ContemptFlat type spin default {} min 0 max 1",
+                    if crate::eval::contempt_flat() { 1 } else { 0 }
+                );
+                // The whole search-control surface, generated from the same
+                // registry `chess params` reads, so the two cannot disagree.
+                #[cfg(feature = "tune")]
+                {
+                    let d = crate::search::Params::default();
+                    for n in crate::search::Params::all_names() {
+                        let (lo, hi) = crate::search::Params::bounds(n).unwrap();
+                        println!(
+                            "option name {n} type spin default {} min {lo} max {hi}",
+                            d.get(n).unwrap()
+                        );
+                    }
+                }
+                println!("uciok");
+            }
+            "isready" => println!("readyok"),
+            "ucinewgame" => {
+                engine.stop();
+                engine.shared.tt.clear();
+                engine.board = Board::startpos();
+                engine.history.clear();
+                if let Ok(mut s) = engine.adapt.lock() { s.clear(); }
+            }
+            "setoption" => {
+                // setoption name <name> value <value>
+                let name_i = t.iter().position(|&x| x == "name");
+                let val_i = t.iter().position(|&x| x == "value");
+                if let Some(ni) = name_i {
+                    let end = val_i.unwrap_or(t.len());
+                    let name = t[ni + 1..end].join(" ");
+                    let value = val_i.map(|vi| t[vi + 1..].join(" ")).unwrap_or_default();
+                    engine.set_option(&name, &value);
+                }
+            }
+            "position" => {
+                let (fen, rest) = if t.get(1) == Some(&"startpos") {
+                    (START_FEN.to_string(), 2)
+                } else if t.get(1) == Some(&"fen") {
+                    let end = t.iter().position(|&x| x == "moves").unwrap_or(t.len());
+                    (t[2..end].join(" "), end)
+                } else {
+                    continue;
+                };
+                let moves: Vec<String> = if t.get(rest) == Some(&"moves") {
+                    t[rest + 1..].iter().map(|s| s.to_string()).collect()
+                } else {
+                    Vec::new()
+                };
+                if let Err(e) = engine.set_position(&fen, &moves) {
+                    eprintln!("info string {e}");
+                }
+            }
+            "go" => {
+                let limits = parse_limits(&t[1..]);
+                engine.go_async(limits);
+            }
+            "stop" => engine.stop(),
+            "quit" => {
+                engine.stop();
+                break;
+            }
+            // Non-standard conveniences.
+            "d" | "board" => println!("{}", engine.board),
+            "eval" => println!("{}", crate::eval::evaluate_pst(&engine.board)),
+            "perft" => {
+                let depth: u32 = t.get(1).and_then(|s| s.parse().ok()).unwrap_or(5);
+                let start = std::time::Instant::now();
+                let mut total = 0;
+                for (m, n) in crate::perft::perft_divide(&engine.board, depth) {
+                    println!("{m}: {n}");
+                    total += n;
+                }
+                let el = start.elapsed().as_secs_f64();
+                println!("\nnodes {total}  time {el:.3}s  {:.1} Mnps", total as f64 / el / 1e6);
+            }
+            _ => {}
+        }
+        let _ = std::io::stdout().flush();
+    }
+}
+
+/// Parse a UCI move against a board without applying it.
+pub fn parse_move(b: &Board, s: &str) -> Option<Move> {
+    let mut list = MoveList::new();
+    generate(b, GenType::All, &mut list);
+    list.find_uci(s)
+}

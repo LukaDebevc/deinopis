@@ -1,0 +1,10 @@
+# Chess engines depend on instructions that are NOT in the x86-64 baseline:
+# popcnt, tzcnt/lzcnt (BMI1) and prefetch. Without this, `u64::count_ones()`
+# compiles to a shift-and-mask sequence instead of a single `popcnt`, which is
+# measurably slower in movegen and eval.
+#
+# `target-cpu=native` binds the binary to THIS machine. For a binary that has to
+# run on the cluster or ship to a tester, build with an explicit baseline
+# instead, e.g. `-C target-cpu=x86-64-v3` (AVX2 + BMI2, covers Zen 2+/Haswell+).
+[build]
+rustflags = ["-C", "target-cpu=native"]

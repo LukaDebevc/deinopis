@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo build --release
+      - run: cargo test --release
+      # The node count is the engine's fingerprint: same code + same net = same
+      # number on any x86-64 CPU (checked at x86-64-v2, v3 and native). The
+      # expected value is the last row of CHECKPOINTS.md.
+      - name: bench fingerprint
+        run: |
+          want=$(grep -E '^\| cp-' CHECKPOINTS.md | tail -1 | cut -d'|' -f5 | tr -d ' ')
+          got=$(./target/release/chess bench --wdl nets/m1-b1.nnue 2>/dev/null \
+                | grep -E '^[0-9]+ nodes' | tail -1 | cut -d' ' -f1)
+          echo "bench $got, CHECKPOINTS.md $want"
+          test "$got" = "$want"
+
+  perft:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo build --release
+      - run: ./target/release/chess perft-suite

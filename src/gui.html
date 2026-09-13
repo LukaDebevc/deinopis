@@ -1,0 +1,607 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>chess</title>
+<style>
+  :root{
+    --bg:#14161a; --panel:#1c1f26; --panel2:#22262f; --line:#2b303b;
+    --fg:#e6e8ec; --dim:#8b93a3; --faint:#5d6572;
+    --light:#e9e3d6; --dark:#7a8290; --sel:#d8b24a; --hint:#4a8fd8;
+    --good:#6fb56f; --bad:#c1503f; --arrow:#e0a52e;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    display:flex;justify-content:center;padding:20px 14px}
+  .wrap{display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start;max-width:1180px}
+
+  /* ---------- board ---------- */
+  .boardCol{display:flex;gap:10px;align-items:flex-start}
+  #evalBar{width:16px;height:calc(var(--sq)*8);--sq:min(10.5vw,68px);
+    background:#2a2f39;border:1px solid var(--line);border-radius:4px;
+    overflow:hidden;position:relative;flex:none}
+  #evalFill{position:absolute;left:0;right:0;bottom:0;background:#e9e3d6;
+    transition:height .25s ease}
+  #evalTxt{position:absolute;left:0;right:0;top:2px;text-align:center;
+    font-size:9px;color:#111;font-weight:600;mix-blend-mode:difference;filter:invert(1)}
+  #boardWrap{position:relative}
+  #board{display:grid;grid-template-columns:repeat(8,var(--sq));
+    grid-template-rows:repeat(8,var(--sq));--sq:min(10.5vw,68px);
+    border:1px solid var(--line);border-radius:6px;overflow:hidden;user-select:none}
+  .sq{position:relative;display:flex;align-items:center;justify-content:center;
+    font-size:calc(var(--sq)*0.78);line-height:1;cursor:pointer}
+  .sq.l{background:var(--light)} .sq.d{background:var(--dark)}
+  .sq.sel{box-shadow:inset 0 0 0 4px var(--sel)}
+  .sq.last{box-shadow:inset 0 0 0 3px rgba(216,178,74,.55)}
+  .sq.chk{box-shadow:inset 0 0 0 4px var(--bad)}
+  .p{pointer-events:none}
+  .p.w{color:#fff;text-shadow:0 0 2px #000,0 1px 2px rgba(0,0,0,.6)}
+  .p.b{color:#111;text-shadow:0 1px 0 rgba(255,255,255,.3)}
+  .dot{position:absolute;width:28%;height:28%;border-radius:50%;
+    background:rgba(74,143,216,.55);pointer-events:none}
+  .ring{position:absolute;inset:6%;border-radius:50%;
+    box-shadow:inset 0 0 0 5px rgba(74,143,216,.55);pointer-events:none}
+  .coord{position:absolute;font-size:10px;color:rgba(0,0,0,.4);pointer-events:none}
+  .coord.f{right:3px;bottom:1px} .coord.r{left:3px;top:1px}
+  #arrows{position:absolute;inset:0;pointer-events:none}
+  #promo{position:absolute;inset:0;background:rgba(0,0,0,.62);display:none;
+    align-items:center;justify-content:center;gap:10px;border-radius:6px}
+  #promo.on{display:flex}
+  #promo button{font-size:34px;padding:8px 12px;line-height:1}
+  #navbar{display:flex;gap:6px;margin-top:10px;align-items:center;flex-wrap:wrap}
+
+  /* ---------- panel ---------- */
+  aside{width:340px;background:var(--panel);border:1px solid var(--line);
+    border-radius:8px;padding:14px}
+  h1{font-size:14px;margin:0 0 4px;letter-spacing:.02em}
+  h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint);
+    margin:16px 0 6px;font-weight:600}
+  .row{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap}
+  button,select,input{background:#252a33;color:var(--fg);border:1px solid var(--line);
+    border-radius:5px;padding:5px 9px;font:inherit;font-size:13px;cursor:pointer}
+  button:hover:not(:disabled){background:#2e343f}
+  button:disabled{opacity:.4;cursor:default}
+  button.on{background:#3a4657;border-color:#4a8fd8}
+  label{font-size:11px;color:var(--dim);display:block;margin-bottom:2px}
+  .field{flex:1;min-width:92px}
+  .field select{width:100%}
+  .stat{display:flex;justify-content:space-between;padding:2px 0;
+    font-variant-numeric:tabular-nums;font-size:12.5px}
+  .stat span:first-child{color:var(--dim)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}
+  #status{margin:8px 0;padding:7px 9px;border-radius:5px;background:var(--panel2);
+    font-size:12.5px;min-height:18px;display:flex;justify-content:space-between;gap:8px}
+  #status.over{background:#3a2b2b;color:#eab0a5}
+  #status.busy{background:#243040;color:#a8c8ec}
+  .bar{height:5px;background:#2a2f39;border-radius:3px;overflow:hidden;margin-top:3px}
+  .bar>i{display:block;height:100%;background:var(--hint);width:0;transition:width .3s}
+  #pv{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--fg);
+    background:var(--panel2);border-radius:5px;padding:7px 9px;min-height:34px;
+    word-break:break-word;line-height:1.6}
+  #iters{font:11.5px ui-monospace,Menlo,monospace;max-height:170px;overflow:auto;
+    border:1px solid var(--line);border-radius:5px}
+  #iters table{border-collapse:collapse;width:100%}
+  #iters td{padding:2px 6px;white-space:nowrap;color:var(--dim)}
+  #iters td.d{color:var(--fg);text-align:right;width:1%}
+  #iters td.s{text-align:right;width:1%;font-variant-numeric:tabular-nums}
+  #iters td.line{color:var(--dim);overflow:hidden;text-overflow:ellipsis;max-width:0}
+  #iters tr:nth-child(odd){background:rgba(255,255,255,.02)}
+  #iters tr.new td.s{color:var(--sel)}
+  #moves{max-height:150px;overflow:auto;font:12px ui-monospace,Menlo,monospace;
+    color:var(--dim);line-height:1.8}
+  #moves b{color:var(--faint);font-weight:400;margin-right:2px}
+  #moves span{cursor:pointer;padding:0 3px;border-radius:3px}
+  #moves span:hover{background:#2e343f;color:var(--fg)}
+  #moves span.cur{background:#3a4657;color:var(--fg)}
+  #fen{width:100%;background:#101318;color:var(--dim);border:1px solid var(--line);
+    border-radius:4px;padding:5px;font:11px ui-monospace,Menlo,monospace;resize:vertical}
+  .note{font-size:11px;color:var(--faint);margin-top:4px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div>
+    <div class="boardCol">
+      <div id="evalBar"><div id="evalFill"></div><div id="evalTxt"></div></div>
+      <div id="boardWrap">
+        <div id="board"></div>
+        <svg id="arrows" viewBox="0 0 8 8" preserveAspectRatio="none"></svg>
+        <div id="promo"></div>
+      </div>
+    </div>
+    <div id="navbar">
+      <button id="startBtn" title="Home">&#124;&laquo;</button>
+      <button id="prevBtn"  title="Left arrow">&laquo;</button>
+      <button id="nextBtn"  title="Right arrow">&raquo;</button>
+      <button id="endBtn"   title="End">&raquo;&#124;</button>
+      <button id="undoBtn">Take back</button>
+      <button id="flipBtn">Flip</button>
+      <button id="newBtn">New game</button>
+    </div>
+  </div>
+
+  <aside>
+    <h1>chess &mdash; local board</h1>
+    <div class="note" id="engineLine">engine idle</div>
+
+    <div id="status"><span id="statusTxt">Your move.</span><span id="statusSub"></span></div>
+
+    <div class="row">
+      <div class="field">
+        <label>You play</label>
+        <select id="side">
+          <option value="w">White</option>
+          <option value="b">Black</option>
+          <option value="n">Both (analysis)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Engine goal</label>
+        <select id="winonly" title="Play for win: the engine scores a draw as a loss, so it will avoid simplifying and keep the position complicated even when that costs material.">
+          <option value="0" selected>Play to win or draw</option>
+          <option value="1">Play for the win only</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Think time</label>
+        <select id="movetime">
+          <option value="200">0.2 s</option>
+          <option value="1000" selected>1 s</option>
+          <option value="3000">3 s</option>
+          <option value="10000">10 s</option>
+          <option value="30000">30 s</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Hash</label>
+        <select id="hash">
+          <option value="16">16 MB</option>
+          <option value="64" selected>64 MB</option>
+          <option value="256">256 MB</option>
+          <option value="1024">1 GB</option>
+        </select>
+      </div>
+    </div>
+    <div class="row">
+      <button id="analyseBtn" title="Search the current position until stopped">Analyse</button>
+      <button id="stopBtn" disabled>Stop</button>
+      <button id="hintBtn" title="Search, show the move, do not play it">Hint</button>
+    </div>
+
+    <h2>Search</h2>
+    <div class="grid2">
+      <div class="stat"><span>depth</span><span id="sDepth">&ndash;</span></div>
+      <div class="stat"><span>seldepth</span><span id="sSel">&ndash;</span></div>
+      <div class="stat"><span>score</span><span id="sScore">&ndash;</span></div>
+      <div class="stat"><span>static</span><span id="sEval">&ndash;</span></div>
+      <div class="stat"><span>nodes</span><span id="sNodes">&ndash;</span></div>
+      <div class="stat"><span>nps</span><span id="sNps">&ndash;</span></div>
+      <div class="stat"><span>time</span><span id="sTime">&ndash;</span></div>
+      <div class="stat"><span>branching</span><span id="sEbf">&ndash;</span></div>
+    </div>
+
+    <h2>Resources</h2>
+    <div class="stat"><span>hash used</span><span id="sHashfull">&ndash;</span></div>
+    <div class="bar"><i id="hashBar"></i></div>
+    <div class="grid2" style="margin-top:6px">
+      <div class="stat"><span>hash size</span><span id="sHashMb">&ndash;</span></div>
+      <div class="stat"><span>threads</span><span id="sThreads">1</span></div>
+      <div class="stat"><span>process RSS</span><span id="sRss">&ndash;</span></div>
+      <div class="stat"><span>cores busy</span><span id="sCores">0 / 1</span></div>
+    </div>
+    <div class="note">Lazy SMP is not wired up yet &mdash; the search is single-threaded whatever the box has.</div>
+
+    <h2>Principal variation</h2>
+    <div id="pv">&ndash;</div>
+
+    <h2>Iterations</h2>
+    <div id="iters"><table><tbody id="iterBody"></tbody></table></div>
+    <div class="note">One row per completed depth. A score that swings or a PV
+      whose first move keeps changing is the search telling you it is unstable.</div>
+
+    <h2>Moves</h2>
+    <div id="moves"></div>
+
+    <h2>Position</h2>
+    <textarea id="fen" rows="2" spellcheck="false" title="Edit and press Enter to load"></textarea>
+  </aside>
+</div>
+
+<script>
+"use strict";
+const START="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+const GLYPH={P:"♙",N:"♘",B:"♗",R:"♖",Q:"♕",K:"♔",
+             p:"♟",n:"♞",b:"♝",r:"♜",q:"♛",k:"♚"};
+const FILES=["a","b","c","d","e","f","g","h"];
+const $=id=>document.getElementById(id);
+
+// ---- game model. The server is stateless: the game IS this object.
+let baseFen=START;      // position the game started from
+let moves=[];           // uci moves played
+let view=0;             // how many of them are on screen
+let state=null;         // server view of the position at `view`
+let flipped=false, sel=null, lastMove=null;
+let searching=false, analysing=false, gen=0;
+let liveCp=null, mateIn=null, iters=[];
+
+// The engine is whichever side the human is not; "n" (analysis) means there
+// is no engine side, and the server falls back to the side to move.
+const engineSide=()=>({w:"b",b:"w"})[$("side").value]||"n";
+const body=extra=>`fen ${baseFen}\nmoves ${moves.slice(0,view).join(" ")}\n`
+  +`winonly ${$("winonly").value}\nengine ${engineSide()}\n`+(extra||"");
+const post=(url,b)=>fetch(url,{method:"POST",body:b||body()});
+const atEnd=()=>view===moves.length;
+
+// ---------------------------------------------------------------- rendering
+function boardFromFen(fen){
+  const rows=fen.split(" ")[0].split("/"), g={};
+  rows.forEach((row,ri)=>{
+    let f=0;
+    for(const c of row){
+      if(c>="1"&&c<="8") f+=+c;
+      else { g[FILES[f]+(8-ri)]=c; f++; }
+    }
+  });
+  return g;
+}
+
+function sqXY(name){                       // centre of a square, board coords
+  let f=FILES.indexOf(name[0]), r=+name[1]-1;
+  if(flipped){ f=7-f; r=7-r; }
+  return [f+0.5, 7-r+0.5];
+}
+
+function drawArrows(line){
+  const svg=$("arrows");
+  svg.innerHTML='<defs><marker id="ah" markerWidth="4" markerHeight="4" refX="2.6" refY="2"'+
+    ' orient="auto"><path d="M0,0 L4,2 L0,4 z" fill="'+getComputedStyle(document.documentElement)
+    .getPropertyValue("--arrow")+'"/></marker></defs>';
+  if(!line||!line.length) return;
+  line.slice(0,3).forEach((uci,i)=>{
+    const [x1,y1]=sqXY(uci.slice(0,2)), [x2,y2]=sqXY(uci.slice(2,4));
+    const dx=x2-x1, dy=y2-y1, len=Math.hypot(dx,dy)||1;
+    const sx=x1+dx/len*0.28, ex=x2-dx/len*0.34;
+    const el=document.createElementNS("http://www.w3.org/2000/svg","line");
+    el.setAttribute("x1",sx); el.setAttribute("y1",y1+dy/len*0.28);
+    el.setAttribute("x2",ex); el.setAttribute("y2",y2-dy/len*0.34);
+    el.setAttribute("stroke","var(--arrow)");
+    el.setAttribute("stroke-width",i===0?0.13:0.08);
+    el.setAttribute("stroke-linecap","round");
+    el.setAttribute("opacity",i===0?0.9:0.34-i*0.08);
+    el.setAttribute("marker-end","url(#ah)");
+    svg.appendChild(el);
+  });
+}
+
+function render(){
+  if(!state) return;
+  const g=boardFromFen(state.fen), board=$("board");
+  board.innerHTML="";
+  const files=flipped?[...FILES].reverse():FILES;
+  const ranks=flipped?[1,2,3,4,5,6,7,8]:[8,7,6,5,4,3,2,1];
+  const targets=sel?state.moves.filter(m=>m.slice(0,2)===sel).map(m=>m.slice(2,4)):[];
+  let kingSq=null;
+  if(state.check){
+    const k=state.stm==="w"?"K":"k";
+    for(const s in g) if(g[s]===k) kingSq=s;
+  }
+  for(const r of ranks) for(const f of files){
+    const name=f+r, d=document.createElement("div");
+    d.className="sq "+(("abcdefgh".indexOf(f)+r)%2===0?"d":"l");
+    if(sel===name) d.classList.add("sel");
+    else if(lastMove&&(lastMove.slice(0,2)===name||lastMove.slice(2,4)===name)) d.classList.add("last");
+    if(kingSq===name) d.classList.add("chk");
+    const p=g[name];
+    if(p){
+      const s=document.createElement("span");
+      s.className="p "+(p===p.toUpperCase()?"w":"b");
+      s.textContent=GLYPH[p]; d.appendChild(s);
+    }
+    if(targets.includes(name)){
+      const m=document.createElement("div"); m.className=p?"ring":"dot"; d.appendChild(m);
+    }
+    if(r===(flipped?8:1)){const c=document.createElement("div");c.className="coord f";c.textContent=f;d.appendChild(c);}
+    if(f===(flipped?"h":"a")){const c=document.createElement("div");c.className="coord r";c.textContent=r;d.appendChild(c);}
+    d.onclick=()=>click(name);
+    board.appendChild(d);
+  }
+  $("fen").value=state.fen;
+  $("sEval").textContent=cpText(state.eval);
+  renderMoves();
+  renderEvalBar();
+  $("prevBtn").disabled=$("startBtn").disabled=view===0;
+  $("nextBtn").disabled=$("endBtn").disabled=atEnd();
+  $("undoBtn").disabled=moves.length===0||searching;
+  $("sHashMb").textContent=(state.hashBytes/1048576).toFixed(0)+" MB";
+  $("sRss").textContent=(state.rss/1048576).toFixed(0)+" MB";
+  setHashfull(state.hashfull);
+}
+
+function renderMoves(){
+  const el=$("moves"); el.innerHTML="";
+  const h=state.history||[];
+  h.forEach((san,i)=>{
+    if(i%2===0){ const b=document.createElement("b"); b.textContent=(i/2+1)+"."; el.appendChild(b); }
+    const s=document.createElement("span");
+    s.textContent=san;
+    if(i===view-1) s.className="cur";
+    s.onclick=()=>goto(i+1);
+    el.appendChild(s);
+    el.appendChild(document.createTextNode(" "));
+  });
+  el.scrollTop=el.scrollHeight;
+}
+
+function cpText(cp){ return (cp>0?"+":"")+(cp/100).toFixed(2); }
+
+function renderEvalBar(){
+  // White's point of view. Live search score when there is one, else the
+  // static eval — labelled as such, because they are very different things.
+  let cp = liveCp!==null ? liveCp : state.eval;
+  if(mateIn!==null){ cp = mateIn>0 ? 10000 : -10000; }
+  const clamped=Math.max(-1000,Math.min(1000,cp));
+  const pct=50+50*(clamped/1000);
+  $("evalFill").style.height=pct+"%";
+  $("evalTxt").textContent = mateIn!==null ? ("#"+Math.abs(mateIn)) : (cp/100).toFixed(1);
+}
+
+function setHashfull(permille){
+  $("sHashfull").textContent=(permille/10).toFixed(1)+" %";
+  $("hashBar").style.width=(permille/10)+"%";
+}
+
+function setStatus(text,cls,sub){
+  const el=$("status");
+  $("statusTxt").textContent=text;
+  $("statusSub").textContent=sub||"";
+  el.className=cls||"";
+}
+
+function terminal(){
+  if(!state) return null;
+  switch(state.status){
+    case "checkmate": return (state.stm==="w"?"Black":"White")+" wins by checkmate.";
+    case "stalemate": return "Draw — stalemate.";
+    case "fifty-move": return "Draw — fifty-move rule.";
+    case "repetition": return "Draw — threefold repetition.";
+    case "insufficient-material": return "Draw — insufficient material.";
+    default: return null;
+  }
+}
+
+// ---------------------------------------------------------------- search
+function resetSearchPanel(){
+  liveCp=null; mateIn=null; iters=[];
+  ["sDepth","sSel","sScore","sNodes","sNps","sTime","sEbf"].forEach(i=>$(i).textContent="–");
+  $("pv").textContent="–"; $("iterBody").innerHTML=""; drawArrows(null);
+}
+
+function onInfo(m){
+  const whitePov = state.stm==="w" ? m.cp : -m.cp;
+  const mate = m.score.startsWith("mate") ? parseInt(m.score.split(" ")[1],10) : null;
+  liveCp = whitePov;
+  mateIn = mate===null ? null : (state.stm==="w"?mate:-mate);
+  $("sDepth").textContent=m.depth;
+  $("sSel").textContent=m.seldepth;
+  $("sScore").textContent = mate!==null ? ("#"+mate) : cpText(m.cp);
+  $("sNodes").textContent=m.nodes.toLocaleString();
+  $("sNps").textContent=(m.nps/1e6).toFixed(2)+" Mn/s";
+  $("sTime").textContent=(m.ms/1000).toFixed(2)+" s";
+  $("sRss").textContent=(m.rss/1048576).toFixed(0)+" MB";
+  setHashfull(m.hashfull);
+  // Effective branching factor: how much a whole extra ply costs. Around 2
+  // means the pruning is working; climbing towards 5+ means it is not.
+  const prev=iters[0];
+  $("sEbf").textContent = prev&&prev.nodes>0 ? (m.nodes/prev.nodes).toFixed(2) : "–";
+  $("pv").textContent=(m.pvSan||[]).join(" ")||"–";
+  drawArrows(m.pv);
+  iters.unshift(m);
+  addIterRow(m, mate);
+}
+
+function addIterRow(m, mate){
+  const tb=$("iterBody");
+  const tr=document.createElement("tr"); tr.className="new";
+  const line=(m.pvSan||[]).slice(0,6).join(" ");
+  tr.innerHTML='<td class="d">'+m.depth+'/'+m.seldepth+'</td>'+
+               '<td class="s">'+(mate!==null?("#"+mate):cpText(m.cp))+'</td>'+
+               '<td class="s">'+fmtNodes(m.nodes)+'</td>'+
+               '<td class="line">'+esc(line)+'</td>';
+  tb.insertBefore(tr,tb.firstChild);
+  while(tb.children.length>24) tb.removeChild(tb.lastChild);
+  setTimeout(()=>tr.classList.remove("new"),400);
+}
+const esc=s=>s.replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const fmtNodes=n=>n>=1e6?(n/1e6).toFixed(1)+"M":n>=1e3?(n/1e3).toFixed(0)+"k":""+n;
+
+/// Stream a search. Returns the bestmove message, or null if superseded.
+async function stream(extra){
+  const my=++gen;
+  searching=true;
+  $("stopBtn").disabled=false;
+  $("sCores").textContent="1 / "+(navigator.hardwareConcurrency||"?");
+  $("engineLine").textContent=analysing?"engine analysing…":"engine thinking…";
+  resetSearchPanel();
+  let best=null;
+  try{
+    const res=await post("/api/think", body(extra));
+    const reader=res.body.getReader(), dec=new TextDecoder();
+    let buf="";
+    for(;;){
+      const {done,value}=await reader.read();
+      if(done) break;
+      buf+=dec.decode(value,{stream:true});
+      let i;
+      while((i=buf.indexOf("\n"))>=0){
+        const line=buf.slice(0,i).trim(); buf=buf.slice(i+1);
+        if(!line) continue;
+        let msg; try{ msg=JSON.parse(line); }catch(e){ continue; }
+        if(gen!==my) continue;
+        if(msg.type==="info") onInfo(msg);
+        else if(msg.type==="bestmove") best=msg;
+        else if(msg.error) setStatus("engine error: "+msg.error,"over");
+      }
+    }
+  }catch(e){
+    setStatus("lost the engine connection","over");
+  }finally{
+    if(gen===my){
+      searching=false;
+      $("stopBtn").disabled=true;
+      $("sCores").textContent="0 / "+(navigator.hardwareConcurrency||"?");
+      $("engineLine").textContent="engine idle";
+    }
+  }
+  return gen===my?best:null;
+}
+
+async function stop(){ await post("/api/stop","").catch(()=>{}); }
+
+// `stop` only raises a flag — the search is still unwinding and the stream is
+// still draining. Anything that restarts a search must wait for the old one to
+// actually finish, or the restart is swallowed by the guard inside stream().
+async function stopAndWait(){
+  if(!searching) return;
+  await stop();
+  for(let i=0;i<300&&searching;i++) await new Promise(r=>setTimeout(r,10));
+}
+
+// ---------------------------------------------------------------- flow
+async function refresh(keepSearchPanel){
+  const r=await post("/api/state");
+  state=await r.json();
+  if(state.error){ setStatus("bad position: "+state.error,"over"); return; }
+  if(!keepSearchPanel) render(); else { render(); }
+  const t=terminal();
+  if(t){ setStatus(t,"over"); return; }
+  if(!atEnd()){
+    setStatus("Reviewing move "+view+" of "+moves.length,"",analysing?"analysing":"engine paused");
+    if(analysing) startAnalysis();   // analysing a past position is the point of stepping back
+    return;
+  }
+  setStatus(state.check?"Check.":"Your move.");
+  if(analysing) startAnalysis(); else maybeEngine();
+}
+
+function engineTurn(){
+  const side=$("side").value;
+  return side!=="n" && state.stm!==side;
+}
+
+async function maybeEngine(){
+  if(searching||analysing||!state||terminal()||!atEnd()||!engineTurn()) return;
+  const best=await stream("movetime "+$("movetime").value+"\n");
+  if(!best||!best.move||best.move==="0000") return;
+  moves.push(best.move); view=moves.length; lastMove=best.move; sel=null;
+  await refresh(true);
+}
+
+async function startAnalysis(){
+  await stopAndWait();
+  if(!analysing||!state||terminal()) return;
+  await stream("infinite 1\n");
+  // Restarted by refresh() whenever the position changes.
+}
+
+async function hint(){
+  if(searching) return;
+  const best=await stream("movetime "+$("movetime").value+"\n");
+  if(best&&best.san) setStatus("Engine suggests "+best.san,"", best.score);
+}
+
+async function play(uci){
+  await stopAndWait();
+  moves=moves.slice(0,view);
+  moves.push(uci); view=moves.length; lastMove=uci; sel=null;
+  await refresh();
+}
+
+function click(sq){
+  if(!state||terminal()||!atEnd()) return;
+  if(!analysing && $("side").value!=="n" && state.stm!==$("side").value) return;
+  if(searching && !analysing) return;
+  if(sel){
+    const cands=state.moves.filter(m=>m.slice(0,2)===sel&&m.slice(2,4)===sq);
+    if(cands.length>1){ askPromo(cands); return; }
+    if(cands.length===1){ play(cands[0]); return; }
+  }
+  sel=state.moves.some(m=>m.slice(0,2)===sq)?sq:null;
+  render();
+}
+
+function askPromo(cands){
+  const box=$("promo"); box.innerHTML=""; box.classList.add("on");
+  const white=state.stm==="w";
+  for(const c of cands){
+    const pc=c[4]||"q", b=document.createElement("button");
+    b.textContent=GLYPH[white?pc.toUpperCase():pc];
+    b.onclick=()=>{ box.classList.remove("on"); play(c); };
+    box.appendChild(b);
+  }
+}
+
+async function goto(i){
+  await stopAndWait();
+  view=Math.max(0,Math.min(moves.length,i));
+  lastMove=view>0?moves[view-1]:null; sel=null;
+  await refresh();
+}
+
+// ---------------------------------------------------------------- controls
+$("newBtn").onclick=async()=>{
+  await stopAndWait();
+  baseFen=START; moves=[]; view=0; sel=null; lastMove=null;
+  resetSearchPanel(); await refresh();
+};
+$("flipBtn").onclick=()=>{ flipped=!flipped; render(); drawArrows(iters[0]&&iters[0].pv); };
+$("undoBtn").onclick=async()=>{
+  await stopAndWait();
+  // Take back a full move so it stays the human's turn, unless both sides
+  // are being played by hand.
+  moves=moves.slice(0,Math.max(0,view-1));
+  if($("side").value!=="n"&&moves.length) moves.pop();
+  view=moves.length; sel=null; lastMove=moves[moves.length-1]||null;
+  await refresh();
+};
+$("startBtn").onclick=()=>goto(0);
+$("prevBtn").onclick=()=>goto(view-1);
+$("nextBtn").onclick=()=>goto(view+1);
+$("endBtn").onclick=()=>goto(moves.length);
+$("stopBtn").onclick=async()=>{ analysing=false; $("analyseBtn").classList.remove("on"); await stopAndWait(); };
+$("hintBtn").onclick=hint;
+$("analyseBtn").onclick=async()=>{
+  analysing=!analysing;
+  $("analyseBtn").classList.toggle("on",analysing);
+  if(analysing) startAnalysis(); else await stopAndWait();
+};
+$("side").onchange=()=>{ flipped=$("side").value==="b"; refresh(); };
+$("winonly").onchange=refresh;
+$("hash").onchange=async()=>{
+  const r=await post("/api/config","hash "+$("hash").value+"\n");
+  const j=await r.json();
+  $("sHashMb").textContent=(j.hashBytes/1048576).toFixed(0)+" MB";
+  setStatus("Hash set to "+(j.hashBytes/1048576).toFixed(0)+" MB (table cleared).");
+};
+$("fen").onkeydown=async e=>{
+  if(e.key!=="Enter"){ return; }
+  e.preventDefault();
+  await stopAndWait();
+  baseFen=$("fen").value.trim()||START; moves=[]; view=0; sel=null; lastMove=null;
+  resetSearchPanel(); await refresh();
+};
+document.addEventListener("keydown",e=>{
+  if(e.target.tagName==="TEXTAREA"||e.target.tagName==="INPUT") return;
+  if(e.key==="ArrowLeft") goto(view-1);
+  else if(e.key==="ArrowRight") goto(view+1);
+  else if(e.key==="Home") goto(0);
+  else if(e.key==="End") goto(moves.length);
+  else if(e.key==="f") $("flipBtn").click();
+  else if(e.key===" "){ e.preventDefault(); $("stopBtn").click(); }
+});
+
+refresh();
+</script>
+</body>
+</html>

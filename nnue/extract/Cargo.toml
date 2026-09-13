@@ -1,0 +1,16 @@
+[package]
+name = "nnue-extract"
+version = "0.1.0"
+edition = "2021"
+
+# Own workspace root: this crate has dependencies and the engine deliberately
+# does not. Keeping it out of the engine's build is the point.
+[workspace]
+
+[dependencies]
+bulletformat = "1.8.0"
+sfbinpack = "=0.6.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

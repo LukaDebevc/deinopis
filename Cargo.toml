@@ -1,0 +1,55 @@
+[package]
+name = "chess"
+version = "0.1.0"
+edition = "2021"
+
+# Measurement-only. `record()` generates moves and runs SEE at every eval
+# call, so it must never be in a playing build.
+[features]
+evalstats = []
+# Counts qsearch stand-pats with a legal quiet check available (the Phase-2
+# blind spot). Generates all moves + a make/check per quiet at every qsearch
+# node, so it must never be in a playing build.
+checkstats = []
+# Writes one line per sampled made move; a Mutex in the search's hot path.
+movedump = []
+# Exposes every `search::Params` constant as a UCI spin option, so an external
+# optimiser (SPSA, OpenBench) can drive the search over the protocol it already
+# speaks. Costs nothing at run time and is still not in a playing build: a
+# parameter an operator can move between games is a version nobody measured.
+tune = []
+# The zone taxonomy and the per-zone CALL COUNTS, with no timing. Implied by
+# both `nodeprof` and `work`; never selected on its own.
+prof = []
+# Counts each leaf operation inside a node and prices it from a frozen table,
+# so cost is deterministic instead of a wall clock. One increment per bracketed
+# call, no rdtsc. See src/work.rs.
+work = ["prof"]
+# Times each leaf operation inside a node with rdtsc. Two timestamp reads per
+# bracketed call in the hot path, so it must never be in a playing build; the
+# check is that `bench` reports the same node count and a lower nps.
+nodeprof = ["prof"]
+# The two diagnostic probes in quiescence: "would a TT read have hit here"
+# and "has quiescence seen this key before". Split out of `nodeprof` because
+# they cost a cache miss and a 32 MB random access per q-node, land outside
+# every zone, and so inflate `control` by ~37% on the WDL bench workload.
+# Implies `nodeprof`; answer the question, then build without it.
+qprobe = ["nodeprof"]
+# Counts hysteresis rebuilds on the search stack; needs the path, so it
+# cannot be priced from a dump. See src/hyst.rs.
+hyst = []
+
+[lib]
+name = "chess"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# Perft / bench builds want debug symbols for `perf`.
+[profile.release-dbg]
+inherits = "release"
+debug = true
