@@ -25,6 +25,7 @@ use crate::board::Board;
 use crate::eval::{Evaluator, Score};
 use crate::qeval::{QuadNet, MAX_FEAT};
 use crate::types::{Color, PieceType};
+use crate::wdleval::fmadd;
 
 // ------------------------------------------------------- constant-width loops
 //
@@ -129,7 +130,7 @@ fn matvec_n<const H: usize, const SKIP: bool>(input: &[f32], w: &[f32], z: &mut 
             continue;
         }
         for k in 0..H {
-            z[k] = a.mul_add(col[k], z[k]);
+            z[k] = fmadd(a, col[k], z[k]);
         }
     }
 }
@@ -142,7 +143,7 @@ fn matvec_dyn<const SKIP: bool>(h: usize, input: &[f32], w: &[f32], z: &mut [f32
             continue;
         }
         for (zk, &wk) in z.iter_mut().zip(col) {
-            *zk = a.mul_add(wk, *zk);
+            *zk = fmadd(a, wk, *zk);
         }
     }
 }
@@ -157,7 +158,6 @@ const MAGIC: u32 = 0x5155_4144;
 /// every game slightly wrong.
 const VERSION: u32 = 5;
 const VERSION_CORELORA: u32 = 6;
-const NFEAT: usize = 768;
 const PAD: u16 = 768;
 /// 32 pieces + 8 `pawnfile` + 7 `pawnpair`.
 const MAX_ALL: usize = 48;

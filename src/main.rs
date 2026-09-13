@@ -8,7 +8,7 @@ use chess::movegen::{generate, GenType};
 use chess::search::{score_to_uci, Limits, Params, Searcher, Shared, ThreadData};
 
 const HELP: &str = "\
-chess — a chess engine
+Deinopis — a chess engine (binary: chess)
 
 USAGE
   chess                      speak UCI on stdin/stdout (default)
@@ -123,12 +123,15 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(|s| s.as_str()) {
         None | Some("uci") => chess::uci::run(),
+        // Before the flag arm below, or `--help` would start UCI and wait.
+        Some("-h" | "--help") => print!("{HELP}"),
         // A leading flag is not a subcommand: `chess --quad net.nnue` is the
         // UCI engine with a net chosen on the command line, which is how two
         // arms of an eval SPRT are the same binary with different weights.
         Some(a) if a.starts_with('-') => chess::uci::run(),
         Some("serve") => {
             let port = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(8080);
+            chess::qeval::warn_if_fallback();
             if let Err(e) = chess::gui::serve(port, 64) {
                 eprintln!("serve failed: {e}");
                 std::process::exit(1);

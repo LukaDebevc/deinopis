@@ -25,7 +25,6 @@
 use crate::board::{Board, START_FEN};
 use crate::chess_move::{Move, MoveList};
 use crate::eval::Score;
-use crate::qeval::DefaultEval;
 use crate::game::{self, Status};
 use crate::movegen::{generate, GenType};
 use crate::san;

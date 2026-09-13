@@ -327,6 +327,30 @@ pub fn net() -> Option<&'static QuadNet> {
 /// search thread and then pushed and popped, not copied per call.
 /// Only build the deep net's accumulator if the WDL net did not claim the slot;
 /// both would otherwise be pushed on every node for one of them to be read.
+/// Which evaluator `DefaultEval` runs in this process, in its own order of
+/// precedence. For people, not for the search: `uci`, `serve` and the `eval`
+/// command say which eval they are using.
+pub fn eval_name() -> &'static str {
+    if crate::wdleval::net().is_some() {
+        "wdl net"
+    } else if crate::deepeval::net().is_some() {
+        "deep net"
+    } else if net().is_some() {
+        "quad net"
+    } else {
+        "PeSTO"
+    }
+}
+
+/// Without `--wdl` the engine still plays, on the hand-written eval, several
+/// hundred Elo weaker and under the same name. Say so once, on stderr, where a
+/// person running it sees it and no UCI parser does.
+pub fn warn_if_fallback() {
+    if eval_name() == "PeSTO" {
+        eprintln!("info string eval: PeSTO fallback, several hundred Elo weaker (no net given; pass --wdl <file>)");
+    }
+}
+
 fn deep_unless_wdl() -> Option<Box<crate::deepeval::DeepEval>> {
     if crate::wdleval::net().is_some() {
         return None;

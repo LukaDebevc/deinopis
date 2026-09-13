@@ -7,6 +7,7 @@
 
 use crate::board::{Board, START_FEN};
 use crate::chess_move::Move;
+use crate::eval::Evaluator;
 use crate::qeval::DefaultEval;
 use crate::movegen::{generate, GenType};
 use crate::chess_move::MoveList;
@@ -16,9 +17,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-pub const NAME: &str = "chess";
+pub const NAME: &str = "Deinopis";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const AUTHOR: &str = "luka";
+pub const AUTHOR: &str = "Luka Debevc";
 
 pub struct Engine {
     pub shared: Arc<Shared>,
@@ -30,6 +31,9 @@ pub struct Engine {
     pub threads: usize,
     hash_mb: usize,
     worker: Option<JoinHandle<()>>,
+    /// The running search has no limit of its own (`go infinite`, or a bare
+    /// `go`), so only `stop` ends it.
+    open_ended: bool,
     adapt: std::sync::Arc<std::sync::Mutex<crate::adaptive::AdaptiveState>>,
 }
 
@@ -45,6 +49,7 @@ impl Engine {
             threads: 1,
             hash_mb: 64,
             worker: None,
+            open_ended: false,
             adapt: std::sync::Arc::new(std::sync::Mutex::new(crate::adaptive::AdaptiveState::new(params))),
         }
     }
@@ -77,6 +82,24 @@ impl Engine {
     pub fn stop(&mut self) {
         self.shared.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.worker.take() {
+            // `go_parallel` clears the flag when it starts, so a `stop` that
+            // lands before the worker gets there would be erased and the join
+            // would never return. Keep raising it until the worker is gone.
+            while !h.is_finished() {
+                self.shared.stop.store(true, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let _ = h.join();
+        }
+    }
+
+    /// End of input. It is not `quit`: `printf 'go depth 8\n' | chess` still
+    /// owes its `bestmove`, so a search with a limit runs to it. One without a
+    /// limit would never finish, so it is stopped, which also prints one.
+    fn finish(&mut self) {
+        if self.open_ended {
+            self.stop();
+        } else if let Some(h) = self.worker.take() {
             let _ = h.join();
         }
     }
@@ -103,6 +126,12 @@ impl Engine {
     fn go_async(&mut self, limits: Limits) {
         self.stop();
         self.shared.stop.store(false, Ordering::Relaxed);
+        self.open_ended = limits.infinite
+            || (limits.depth.is_none()
+                && limits.nodes.is_none()
+                && limits.work.is_none()
+                && limits.movetime.is_none()
+                && limits.time[self.board.stm().index()].is_none());
         let shared = Arc::clone(&self.shared);
         let board = self.board;
         let history = self.history.clone();
@@ -169,6 +198,10 @@ impl Engine {
     }
 
     fn set_option(&mut self, name: &str, value: &str) {
+        // UCI only allows `setoption` while idle, and every option below
+        // assumes it: "hash" swaps `self.shared`, and a worker still holding
+        // the old `Arc` would never see the new stop flag, so `stop` hung.
+        self.stop();
         match name.to_ascii_lowercase().as_str() {
             "hash" => {
                 if let Ok(mb) = value.parse::<usize>() {
@@ -262,6 +295,7 @@ fn parse_limits(tokens: &[&str]) -> Limits {
 }
 
 pub fn run() {
+    crate::qeval::warn_if_fallback();
     let mut engine = Engine::new();
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
@@ -358,7 +392,11 @@ pub fn run() {
             }
             // Non-standard conveniences.
             "d" | "board" => println!("{}", engine.board),
-            "eval" => println!("{}", crate::eval::evaluate_pst(&engine.board)),
+            // What the search uses, not the PeSTO table, and which eval it was.
+            "eval" => {
+                let cp = DefaultEval::without_adaptive().evaluate(&engine.board);
+                println!("{cp} cp (side to move, {})", crate::qeval::eval_name());
+            }
             "perft" => {
                 let depth: u32 = t.get(1).and_then(|s| s.parse().ok()).unwrap_or(5);
                 let start = std::time::Instant::now();
@@ -374,6 +412,7 @@ pub fn run() {
         }
         let _ = std::io::stdout().flush();
     }
+    engine.finish();
 }
 
 /// Parse a UCI move against a board without applying it.

@@ -1,4 +1,6 @@
-# chess
+# Deinopis
+
+Named after the net-casting spider, which hunts by throwing a net.
 
 A chess engine in Rust, written from scratch with no dependencies, with a
 neural evaluation trained by its own PyTorch pipeline. It rates **about 3246
@@ -101,14 +103,16 @@ under: perft before anything, a bench after every change, no version kept
 without the gate, every result in the ledger. I choose the questions, design
 the experiments and decide what is kept. Session handover notes, the working
 backlog and raw run logs stay in a private working copy, so some ledger
-entries cite scripts and logs that are not in this repository.
+entries cite scripts and logs that are not in this repository. For the same
+reason the commit history here starts at `cp-0004`: the development history is
+the [ledger](LEDGER.md), one entry per experiment, dated.
 
 ## Layout
 
 | path | what |
 |---|---|
 | `src/` | the engine |
-| `tests/` | search and harness correctness |
+| `tests/` | search, harness and UCI correctness |
 | `nets/` | the net the current checkpoint plays with |
 | `ENGINE.md` | what the engine does, with the actual formulas |
 | `ARCHITECTURE.md` | how the code is laid out and why |

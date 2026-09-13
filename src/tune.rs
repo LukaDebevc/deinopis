@@ -67,7 +67,7 @@ use crate::eval::Score;
 use crate::qeval::DefaultEval;
 use crate::movegen::{generate, GenType};
 use crate::san::san;
-use crate::search::{Limits, Params, Pricing, SearchResult, Searcher, Shared, ThreadData};
+use crate::search::{Limits, Params, SearchResult, Searcher, Shared, ThreadData};
 
 /// One position, with the reference search's opinion of its best few moves.
 #[derive(Clone)]

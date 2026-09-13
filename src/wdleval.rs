@@ -154,6 +154,25 @@ macro_rules! matvec {
 /// and let FMA be the win it should be everywhere.
 const U: usize = 4;
 
+/// `a * b + c`, fused where the target has FMA.
+///
+/// `f32::mul_add` promises a single rounding, so on a target without FMA it
+/// cannot be a multiply and an add: it becomes a call into libm per element,
+/// and the net ran 16x slower on an x86-64-v2 build (49k vs 528k nps, same
+/// nodes; library/016 A8). Native and v3 builds have FMA and compile exactly
+/// as before.
+#[inline(always)]
+pub(crate) fn fmadd(a: f32, b: f32, c: f32) -> f32 {
+    #[cfg(target_feature = "fma")]
+    {
+        a.mul_add(b, c)
+    }
+    #[cfg(not(target_feature = "fma"))]
+    {
+        a * b + c
+    }
+}
+
 /// One step of the unrolled matvec: `p[k] += x * row[k]`, `row` already sliced
 /// to exactly `DO` so nothing in here can branch out of the loop.
 #[inline(always)]
@@ -162,7 +181,7 @@ fn step<const DO: usize, const SKIP: bool>(x: f32, row: &[f32], p: &mut [f32; DO
         return;
     }
     for k in 0..DO {
-        p[k] = x.mul_add(row[k], p[k]);
+        p[k] = fmadd(x, row[k], p[k]);
     }
 }
 
@@ -172,7 +191,7 @@ fn stepq<const DO: usize, const SKIP: bool>(x: f32, row: &[i8], p: &mut [f32; DO
         return;
     }
     for k in 0..DO {
-        p[k] = x.mul_add(row[k] as f32, p[k]);
+        p[k] = fmadd(x, row[k] as f32, p[k]);
     }
 }
 
@@ -220,7 +239,7 @@ fn matvec_dyn<const SKIP: bool>(n: usize, input: &[f32], w: &[f32], z: &mut [f32
             continue;
         }
         for (zk, &wk) in z.iter_mut().zip(row) {
-            *zk = x.mul_add(wk, *zk);
+            *zk = fmadd(x, wk, *zk);
         }
     }
 }
@@ -267,7 +286,7 @@ fn matvecq_dyn<const SKIP: bool>(n: usize, input: &[f32], w: &[i8], z: &mut [f32
             continue;
         }
         for (zk, &wk) in z.iter_mut().zip(row) {
-            *zk = x.mul_add(wk as f32, *zk);
+            *zk = fmadd(x, wk as f32, *zk);
         }
     }
 }
@@ -1055,7 +1074,7 @@ impl WdlNet {
             }};
         }
         // One untimed pass so the first prefix does not pay for cold weights.
-        pass!(8);
+        let _ = pass!(8);
         t[0] = pass!(1);
         t[1] = pass!(2);
         t[2] = pass!(3);
