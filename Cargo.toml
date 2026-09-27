@@ -13,6 +13,9 @@ evalstats = []
 checkstats = []
 # Writes one line per sampled made move; a Mutex in the search's hot path.
 movedump = []
+# Writes one line per sampled pruning-decision node (src/nodedump.rs); a
+# Mutex and a write per sample, so never in a playing build.
+nodedump = []
 # Exposes every `search::Params` constant as a UCI spin option, so an external
 # optimiser (SPSA, OpenBench) can drive the search over the protocol it already
 # speaks. Costs nothing at run time and is still not in a playing build: a

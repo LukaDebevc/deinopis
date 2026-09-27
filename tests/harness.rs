@@ -58,12 +58,41 @@ fn every_book_line_is_legal() {
     }
 }
 
+// The default book is compiled in, so a bad line in `books/lich.epd` is a
+// build-time asset that only fails when a match starts 40 minutes deep. Parse
+// it here instead, and check the two properties a book must have: every start
+// position is legal with a move available, and no two lines are the same
+// position -- the second is what makes the printed SE honest (LEDGER 112).
+#[test]
+fn default_book_is_legal_and_distinct() {
+    setup();
+    let book = chess::book::default_book();
+    assert!(book.len() >= 1500, "default book has {} lines; below ~1500 the design effect returns", book.len());
+    let mut fens: Vec<String> = Vec::with_capacity(book.len());
+    for o in &book {
+        let b = Board::from_fen(&o.start_fen)
+            .unwrap_or_else(|e| panic!("default book: bad FEN '{}': {e}", o.start_fen));
+        assert!(o.moves.is_empty(), "default book is EPD; line carries moves");
+        assert_eq!(
+            game::status(&b, &[]),
+            Status::Ongoing,
+            "default book position '{}' is already over",
+            o.start_fen
+        );
+        fens.push(b.to_fen());
+    }
+    let n = fens.len();
+    fens.sort();
+    fens.dedup();
+    assert_eq!(fens.len(), n, "default book repeats {} positions", n - fens.len());
+}
+
 #[test]
 fn book_lines_are_distinct() {
     setup();
     let mut fens: Vec<String> = chess::book::builtin()
         .iter()
-        .map(|l| play(&l.join(" ")).0.to_fen())
+        .map(|l| play(&l.moves.join(" ")).0.to_fen())
         .collect();
     let n = fens.len();
     fens.sort();
@@ -330,4 +359,62 @@ fn promotion_uci_is_case_insensitive() {
     // Case-insensitivity must not invent legal moves.
     assert!(list.find_uci("a7a8K").is_none());
     assert!(list.find_uci("h2h4").is_none());
+}
+
+// ------------------------------------------------------- book: the two formats
+
+#[test]
+fn book_reads_uci_move_lines() {
+    setup();
+    let op = chess::book::parse_line("e2e4 e7e5 g1f3").unwrap();
+    assert!(op.from_startpos());
+    assert_eq!(op.moves, vec!["e2e4", "e7e5", "g1f3"]);
+}
+
+#[test]
+fn book_reads_epd_and_strips_opcodes() {
+    setup();
+    // Stockfish's books end the record with `;` opcodes; lichess's with `[0.0]`.
+    // Both must yield the same position, and neither suffix may leak into the
+    // FEN -- a stray token there becomes a bogus halfmove counter.
+    let sf = chess::book::parse_line(
+        "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4 ; id \"x\";",
+    )
+    .unwrap();
+    let li = chess::book::parse_line(
+        "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4 [0.0]",
+    )
+    .unwrap();
+    assert_eq!(sf, li);
+    assert!(!sf.from_startpos());
+    assert!(sf.moves.is_empty());
+    assert_eq!(chess::board::Board::from_fen(&sf.start_fen).unwrap().fullmove(), 4);
+}
+
+#[test]
+fn book_epd_without_counters_gets_defaults() {
+    setup();
+    // A bare EPD has only four fields. It must still load, with the counters
+    // defaulted rather than the line rejected.
+    let op = chess::book::parse_line(
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -",
+    )
+    .unwrap();
+    let b = chess::board::Board::from_fen(&op.start_fen).unwrap();
+    assert_eq!((b.halfmove(), b.fullmove()), (0, 1));
+}
+
+#[test]
+fn book_rejects_a_position_with_no_move() {
+    setup();
+    // Stalemate: legal as a position, useless as an opening, and it would
+    // otherwise be discovered as a 0-ply game in the middle of a match.
+    let e = chess::book::parse_line("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1").unwrap_err();
+    assert!(e.contains("no legal move"), "unexpected error: {e}");
+}
+
+#[test]
+fn book_rejects_a_bad_fen() {
+    setup();
+    assert!(chess::book::parse_line("not/a/fen w KQkq - 0 1").is_err());
 }

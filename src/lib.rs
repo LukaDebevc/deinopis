@@ -33,6 +33,8 @@ pub mod wdleval;
 pub mod hyst;
 #[cfg(feature = "movedump")]
 pub mod movedump;
+#[cfg(feature = "nodedump")]
+pub mod nodedump;
 pub mod nodeprof;
 pub mod work;
 pub mod qeval;
@@ -60,6 +62,7 @@ pub fn init() {
     adaptive::init_from_env();
     search::init_pot();
     search::init_corr();
+    search::init_conth();
     qeval::init_dual();
     eval::init_from_args();
 }

@@ -1,0 +1,38 @@
+rows 493182  files 32  static==dump 1.0000
+kept 0.9678 (mate / |score|>=3000 / missing own-depth iteration dropped)
+depth histogram {1: 235254, 2: 119215, 3: 63100, 4: 31429, 5: 15838, 6: 7167, 7: 3368, 8: 1255, 9: 410, 10: 155, 11: 58, 12: 28, 13: 14, 14: 9, 15: 2, 16: 2, 17: 4, 18: 2, 19: 2, 20: 1, 21: 1, 23: 1, 31: 1, 65: 1, 99: 1, 104: 1}
+train 282268  early-stop 103998  val 91053   sd(v_own-static) 435.5 cp   median |dev| 132   q!=static 0.416
+median |dev| by |static| bin: {'<50': 48.0, '<150': 85.0, '<400': 129.0, '<1000': 213.0, '<3000': 163.0}
+sd(v_own-static) by depth: {1: 415.8, 2: 447.2, 3: 447.7, 4: 460.8, 5: 471.3, 6: 483.6, 7: 509.3}
+
+== P1 sigma: held-out r2 on ln(|v_own-static|+1), Laplace NLL gain vs constant scale (nats/row)
+  hand             r2 0.0771   NLL gain -5.7056
+  hand+q           r2 0.5450   NLL gain -8.0142
+  hand+zv(l2)      r2 0.1297   NLL gain -6.3903
+  hand+hv(up)      r2 0.1363   NLL gain -5.4958
+  hand+cu(mid)     r2 0.1550   NLL gain -4.4862
+  hand+all163      r2 0.1905   NLL gain -4.7498
+  hand+q+all163    r2 0.5823   NLL gain -3.3901
+  hand+all163 MLP64 r2 0.2568   NLL gain +0.1401
+  hand+q+all163 MLP64 r2 0.6467   NLL gain +0.5355
+
+== best move is a capture: base rate 0.430, held-out AUC
+  hand             AUC 0.6071
+  hand+q           AUC 0.9122
+  hand+zv(l2)      AUC 0.6318
+  hand+all163      AUC 0.6972
+
+== q != static: base rate 0.416, held-out AUC
+  hand             AUC 0.5845
+  hand+zv(l2)      AUC 0.6370
+  hand+all163      AUC 0.7137
+
+== P2 RFP replay on held-out rows (wrong = v_own < beta)
+  rows 90668   today: prunes 43028 (0.475)  wrong 333 (0.0077 of prunes)
+  hand                 same prunes -> wrong   366 (+9.9%)   same wrong -> prunes  41413 (-3.8%)
+  hand+q               same prunes -> wrong   756 (+127.0%)   same wrong -> prunes  30036 (-30.2%)
+  hand+zv(l2)          same prunes -> wrong   354 (+6.3%)   same wrong -> prunes  42004 (-2.4%)
+  hand+all163          same prunes -> wrong   357 (+7.2%)   same wrong -> prunes  41430 (-3.7%)
+  hand+all163 MLP64    same prunes -> wrong   412 (+23.7%)   same wrong -> prunes  39067 (-9.2%)
+  hand+q+all163 MLP64  same prunes -> wrong   569 (+70.9%)   same wrong -> prunes  37993 (-11.7%)
+DONE

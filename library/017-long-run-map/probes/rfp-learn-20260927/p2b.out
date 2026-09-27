@@ -1,0 +1,24 @@
+rows 475371 (depth<=7)  q>=static always: True
+
+== sign of the error, v_own - static
+  all           n  475371  mean  +227.3  median  +83.0  P(>0) 0.732  P(<-100) 0.092  P(>+100) 0.470
+  q==static     n  277599  mean   +10.1  median   +9.0  P(>0) 0.554  P(<-100) 0.154  P(>+100) 0.198
+  q>static      n  197772  mean  +532.2  median +410.0  P(>0) 0.982  P(<-100) 0.005  P(>+100) 0.852
+  static>=beta  n  353263  mean  +217.3  median  +78.0  P(>0) 0.724  P(<-100) 0.088  P(>+100) 0.461
+
+== sigma refit (exact): held-out r2 on ln(|dev|+1) and Laplace NLL gain (nats/row)
+  hand           r2 0.0781   NLL gain +0.0174
+  hand+q         r2 0.5492   NLL gain +0.4255
+  hand+zv        r2 0.1345   NLL gain +0.0452
+  hand+all163    r2 0.1940   NLL gain +0.0995
+  hand+q+all163  r2 0.5867   NLL gain +0.4740
+
+== downside classifier P(v_own < beta), candidate rows static >= beta, held-out
+  candidates in val 67414  fail-low rate 0.0326   today: prunes 43028  wrong 333 (0.7739%)
+  margin only            AUC 0.8275   same prunes -> wrong   339 (+1.8%)   same wrong -> prunes  42846 (-0.4%)
+  margin+hand            AUC 0.8684   same prunes -> wrong   204 (-38.7%)   same wrong -> prunes  49540 (+15.1%)
+  margin+hand+zv         AUC 0.8949   same prunes -> wrong   137 (-58.9%)   same wrong -> prunes  52228 (+21.4%)
+  margin+hand+all163     AUC 0.8994   same prunes -> wrong   125 (-62.5%)   same wrong -> prunes  52687 (+22.4%)
+  margin+hand+q          AUC 0.9114   same prunes -> wrong   113 (-66.1%)   same wrong -> prunes  54509 (+26.7%)
+  margin+hand+q+all163   AUC 0.9330   same prunes -> wrong    56 (-83.2%)   same wrong -> prunes  57166 (+32.9%)
+DONE

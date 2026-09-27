@@ -1,0 +1,360 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index f6895a3..6a1e4f9 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -13,6 +13,9 @@ evalstats = []
+ checkstats = []
+ # Writes one line per sampled made move; a Mutex in the search's hot path.
+ movedump = []
++# Writes one line per sampled pruning-decision node (src/nodedump.rs); a
++# Mutex and a write per sample, so never in a playing build.
++nodedump = []
+ # Exposes every `search::Params` constant as a UCI spin option, so an external
+ # optimiser (SPSA, OpenBench) can drive the search over the protocol it already
+ # speaks. Costs nothing at run time and is still not in a playing build: a
+diff --git a/src/eval.rs b/src/eval.rs
+index d0c22f0..8004e04 100644
+--- a/src/eval.rs
++++ b/src/eval.rs
+@@ -385,6 +385,12 @@ pub trait Evaluator: Send {
+     /// Runtime learning: predicted vs actual (backed) score at this node.
+     /// Default no-op; adaptive eval overrides it.
+     fn observe(&mut self, _b: &Board, _predicted: Score, _actual: Score, _is_q: bool) {}
++    /// The net's l2 output from the last `evaluate`, for the learned RFP's
++    /// arm 2 (LEDGER 119). Only valid right after `evaluate` of the board the
++    /// caller means; `None` for evaluators without one.
++    fn l2_out(&self) -> Option<&[f32]> {
++        None
++    }
+ }
+ 
+ #[derive(Default, Clone)]
+diff --git a/src/lib.rs b/src/lib.rs
+index b1216ca..1f45a3e 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -33,6 +33,8 @@ pub mod wdleval;
+ pub mod hyst;
+ #[cfg(feature = "movedump")]
+ pub mod movedump;
++#[cfg(feature = "nodedump")]
++pub mod nodedump;
+ pub mod nodeprof;
+ pub mod work;
+ pub mod qeval;
+diff --git a/src/main.rs b/src/main.rs
+index 0eda9d6..b79cc17 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -213,6 +213,22 @@ fn main() {
+         Some("params") => params_cmd(&args[1..]),
+         Some("features") => features_cmd(),
+         Some("fendump") => fen_dump(&args[1..]),
++        Some("nodelabel") => node_label(&args[1..]),
++        Some("rfpcheck") => {
++            // stdin: fen TAB depth TAB g TAB improving TAB ply; stdout: logit H, logit Z.
++            use std::io::BufRead;
++            let shared = Shared::new(1);
++            let mut s = Searcher::new(&shared, ThreadData::new(0), DefaultEval::default(), Params::default());
++            for line in std::io::stdin().lock().lines() {
++                let line = line.unwrap();
++                let c: Vec<&str> = line.split('\t').collect();
++                let b = Board::from_fen(c[0]).unwrap();
++                let (d, g, i, p) = (c[1].parse().unwrap(), c[2].parse().unwrap(), c[3] == "1", c[4].parse().unwrap());
++                let h = s.rfp_logit_probe(&b, 1, d, g, i, p);
++                let z = s.rfp_logit_probe(&b, 2, d, g, i, p);
++                println!("{h:.4}\t{z:.4}");
++            }
++        }
+         _ => print!("{HELP}"),
+     }
+ }
+@@ -302,6 +318,75 @@ fn fen_dump(rest: &[String]) {
+     }
+ }
+ 
++/// `chess nodelabel IN OUT [--nodes N] [--hash MB]` — label the nodes
++/// `--features nodedump` sampled from the tree, for the uncertainty-head probe.
++///
++/// Per input line (the dump's TSV), one output line in `OUT.tsv`:
++/// the seven dump columns, then `static q vfinal dfinal nodes best best_cap
++/// mate v1 .. v12` -- every score from the node's side to move, with that side
++/// as the contempt side, `v_d` the score of completed iteration `d` of one
++/// `--nodes`-bounded search (`nan` past the last), `best_cap` whether that
++/// search's best move captures. `OUT.f32` gets the net's inner layers
++/// (`WdlNet::inner`) as little-endian f32, one fixed-width row per line.
++/// Each position gets a fresh search and a cleared hash, so a label does not
++/// depend on which positions came before it.
++fn node_label(rest: &[String]) {
++    use std::io::{BufRead, Write};
++    let (Some(inp), Some(outp)) = (rest.first(), rest.get(1)) else {
++        eprintln!("usage: chess nodelabel IN OUT [--nodes N] [--hash MB] (needs --wdl or $CHESS_WDL)");
++        std::process::exit(2);
++    };
++    let flag = |k: &str, d: u64| {
++        rest.iter().position(|a| a == k).and_then(|i| rest.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(d)
++    };
++    let nodes = flag("--nodes", 65536);
++    let Some(net) = chess::wdleval::net() else {
++        eprintln!("nodelabel needs a WDL net: --wdl <file> (or $CHESS_WDL)");
++        std::process::exit(2);
++    };
++    let shared = Shared::new(flag("--hash", 16) as usize);
++    let limits = Limits { nodes: Some(nodes), ..Default::default() };
++    let f = std::fs::File::open(inp).unwrap_or_else(|e| panic!("{inp}: {e}"));
++    let mut tsv = std::io::BufWriter::new(std::fs::File::create(format!("{outp}.tsv")).unwrap());
++    let mut bin = std::io::BufWriter::new(std::fs::File::create(format!("{outp}.f32")).unwrap());
++    const MAXD: usize = 12;
++    for line in std::io::BufReader::new(f).lines() {
++        let line = line.unwrap();
++        let Some(fen) = line.split('\t').next() else { continue };
++        let Ok(b) = Board::from_fen(fen) else { continue };
++        shared.tt.clear();
++        let mut s = Searcher::new(&shared, ThreadData::new(0), DefaultEval::default(), Params::default());
++        let q = s.qsearch_value(&b);
++        let st = net.cp_from_logits_asym(net.raw(&b), true);
++        let mut v = [f64::NAN; MAXD];
++        let mut cb = |r: &chess::search::SearchResult, _: std::time::Duration, _: usize| {
++            if (1..=MAXD as u32).contains(&r.depth) {
++                v[r.depth as usize - 1] = r.score as f64;
++            }
++        };
++        shared.tt.clear();
++        let r = s.go(&b, &[], &limits, Some(&mut cb));
++        let vs: Vec<String> = v.iter().map(|x| if x.is_nan() { "nan".into() } else { format!("{x}") }).collect();
++        writeln!(
++            tsv,
++            "{line}\t{st}\t{q}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
++            r.score,
++            r.depth,
++            r.nodes,
++            r.best_move,
++            r.best_move.is_capture() as u8,
++            chess::eval::is_mate_score(r.score) as u8,
++            vs.join("\t")
++        )
++        .unwrap();
++        for x in net.inner(&b) {
++            bin.write_all(&x.to_le_bytes()).unwrap();
++        }
++    }
++    tsv.flush().unwrap();
++    bin.flush().unwrap();
++}
++
+ fn eval_fens() {
+     use std::io::BufRead;
+     let net = chess::qeval::net();
+diff --git a/src/qeval.rs b/src/qeval.rs
+index 2f9f959..e5cb74c 100644
+--- a/src/qeval.rs
++++ b/src/qeval.rs
+@@ -492,6 +492,10 @@ fn perturb(s: Score, key: u64, sig: f32) -> Score {
+ }
+ 
+ impl Evaluator for DefaultEval {
++    fn l2_out(&self) -> Option<&[f32]> {
++        if self.small { None } else { self.wdl.as_ref().and_then(|d| d.l2_out()) }
++    }
++
+     fn evaluate(&mut self, b: &Board) -> Score {
+         // Q-tier behind `--dual`. A dual file serves the distilled small tail
+         // off the live accumulator; a single-tail file keeps the rung-1
+diff --git a/src/search.rs b/src/search.rs
+index 1291c9a..8505eb2 100644
+--- a/src/search.rs
++++ b/src/search.rs
+@@ -337,6 +337,14 @@ pub struct Params {
+         /// has improved on its static eval of two plies ago. 1000 is
+         /// Stockfish's shape. 0 disables (bench-exact).
+         pub rfp_improving = 0, 0, 4000;
++        /// Learned RFP (LEDGER 119): 0 off (the margin rule above), 1 = a
++        /// logistic P(fail low) over free node features, 2 = the same plus the
++        /// net's l2 output. Where it is on it replaces the margin test: prune
++        /// when the logit is below `rfp_learn_thr`. 3 / 4 are 1 / 2 with a
++        /// per-depth threshold instead. Off is bench-exact.
++        pub rfp_learn = 0, 0, 4;
++        /// The prune threshold of `rfp_learn`, in milli-logits.
++        pub rfp_learn_thr = -3820, -9000, 0;
+         /// SR-7: null-move reduction grows by `min((eval - beta) / this,
+         /// nmp_eval_max)` plies. 0 disables (bench-exact).
+         pub nmp_eval_div = 0, 0, 2000;
+@@ -990,6 +998,24 @@ impl Default for PathInfo {
+ /// integers, row-major over x,y in 1..=3) so one binary plays N arms in a
+ /// tournament. Zero by default, in which case the move loop below is
+ /// bit-identical (bench-exact).
++// Learned RFP weights (LEDGER 119), from `fitexport.py` on the 20260927-sigma
++// node dump: logistic P(v_d < beta) on raw features, standardisation folded in.
++// `_H` reads 9 free node features; `_Z` the same 9 then the net's 64 l2 outputs
++// (`WdlNet::inner` columns 96..160, which is `Evaluator::l2_out`).
++#[allow(clippy::excessive_precision)]
++const RFP_H_B: f32 = -3.145206e+00;
++#[allow(clippy::excessive_precision)]
++const RFP_H_W: [f32; 9] = [-5.762602e-01, -2.762879e-03, 1.994645e-01, -1.698171e-01, -6.795863e-02, -2.848573e-02, 3.994842e-01, -6.698034e-01, 8.431149e-01];
++#[allow(clippy::excessive_precision)]
++const RFP_Z_B: f32 = -1.986873e+00;
++#[allow(clippy::excessive_precision)]
++const RFP_Z_W: [f32; 73] = [-6.088694e-01, -2.962534e-03, 1.985348e-01, -1.900976e-01, -9.480860e-02, -1.386348e-02, 2.345615e-01, -5.710326e-01, 7.103600e-01, 5.465054e-01, -4.282236e-01, -3.134279e-02, 1.334073e-01, -7.846901e-02, 1.767825e-01, -6.660627e-01, 3.888184e-01, -1.583815e-01, 3.541801e-02, 2.508111e-01, 1.055898e-01, 4.975738e-01, -1.499843e-01, -5.126530e-02, -2.597781e-01, 2.490778e-01, 3.569831e-02, -3.578319e-01, -4.759546e-01, -4.557673e-01, 7.282153e-02, 2.669040e-01, 2.092466e-01, -8.786025e-02, 9.990575e-01, 1.324753e-01, -3.002607e-01, 1.100589e-01, -1.616404e-01, -1.397819e-01, 1.229940e-01, 2.415729e-01, 6.245322e-01, 8.015288e-02, -4.760281e-02, -3.285268e-01, -1.307655e-01, 5.355704e-01, -2.418678e-01, 4.947169e-01, 3.334403e-02, 5.978701e-02, -1.782107e-01, -2.476316e-01, -8.191586e-01, 1.539101e-01, -1.190389e-01, 5.509367e-01, -8.021862e-03, 4.595032e-02, 7.564545e-02, -6.146475e-02, 1.817779e-01, -2.062514e-01, -7.765185e-02, -1.452111e-01, 1.793767e+00, -9.782826e-02, 4.793020e-02, -1.879356e-01, -5.132470e-02, -1.050082e-01, 1.861128e-01];
++
++// Per-depth thresholds (`p2c.py`): the logit quantile that prunes today's
++// fraction of candidates at each depth 1..7.
++const RFP_H_THR: [f32; 7] = [-3.8392, -3.8410, -3.8245, -3.7748, -3.6417, -3.4802, -3.2745];
++const RFP_Z_THR: [f32; 7] = [-4.0395, -4.0416, -4.0180, -3.9542, -3.8224, -3.6505, -3.4687];
++
+ static POT: std::sync::OnceLock<[[i32; 4]; 4]> = std::sync::OnceLock::new();
+ static POT_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+ 
+@@ -1317,6 +1343,77 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
+     /// TT and the killer tables, so depth N with the previous iterations is
+     /// reached FASTER than depth N from scratch, because move ordering is that
+     /// much better.
++    /// The learned RFP's logit of P(this node fails low at its depth), LEDGER
++    /// 119. Features and weights are `fitexport.py`'s, fitted on 493k nodes
++    /// sampled at this very block (`--features nodedump`) and labelled by the
++    /// node's own depth-`d` iteration of a 64k-node search. `g = eval - beta`,
++    /// `>= 0` here. `stale` says the static eval came from the hash, so the
++    /// evaluator's l2 buffer describes some other board: arm 2 re-evaluates.
++    /// The learned RFP's prune threshold: `rfp_learn_thr` for arms 1/2, the
++    /// per-depth table for 3/4 (today's prune count at every depth, so the
++    /// classifier only chooses WHICH nodes; LEDGER 119).
++    fn rfp_thr(&self, depth: i32) -> f32 {
++        let i = (depth.clamp(1, 7) - 1) as usize;
++        match self.params.rfp_learn {
++            3 => RFP_H_THR[i],
++            4 => RFP_Z_THR[i],
++            _ => self.params.rfp_learn_thr as f32 / 1000.0,
++        }
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    fn rfp_logit(&mut self, b: &Board, depth: i32, g: Score, st: Score, improving: bool, ply: usize, stale: bool) -> f32 {
++        use crate::types::PieceType as P;
++        let npm = 3 * (b.pieces(P::Knight).count() + b.pieces(P::Bishop).count())
++            + 5 * b.pieces(P::Rook).count()
++            + 9 * b.pieces(P::Queen).count();
++        let (g, d) = (g as f32, depth.max(1) as f32);
++        let lg = g.ln_1p();
++        let f = [
++            lg, g / d, d, lg / d,
++            (npm as f32).ln_1p(), b.pieces(P::Pawn).count() as f32,
++            (st.unsigned_abs() as f32).ln_1p(), improving as u8 as f32, (ply as f32).ln_1p(),
++        ];
++        if self.params.rfp_learn % 2 == 1 {
++            return RFP_H_B + f.iter().zip(RFP_H_W.iter()).map(|(x, w)| x * w).sum::<f32>();
++        }
++        if stale {
++            self.eval.evaluate(b);
++        }
++        let Some(zv) = self.eval.l2_out() else {
++            return RFP_H_B + f.iter().zip(RFP_H_W.iter()).map(|(x, w)| x * w).sum::<f32>();
++        };
++        let (wf, wz) = RFP_Z_W.split_at(9);
++        RFP_Z_B
++            + f.iter().zip(wf).map(|(x, w)| x * w).sum::<f32>()
++            + zv.iter().zip(wz).map(|(x, w)| x * w).sum::<f32>()
++    }
++
++    /// `chess rfpcheck`: the learned RFP's logit for `root` under arm `arm`,
++    /// from a fresh evaluation, so the Rust features can be checked against
++    /// `fitexport.py` row for row.
++    pub fn rfp_logit_probe(&mut self, root: &Board, arm: i32, depth: i32, g: Score, improving: bool, ply: usize) -> f32 {
++        eval::set_root(root.stm());
++        let st = self.eval.evaluate(root);
++        self.params.rfp_learn = arm;
++        self.rfp_logit(root, depth, g, st, improving, ply, false)
++    }
++
++    /// A full-window quiescence search of `root`, from its side to move, with
++    /// `root`'s side as the contempt side. For `chess nodelabel`, which needs
++    /// the value the search would stand on before it spends any depth.
++    pub fn qsearch_value(&mut self, root: &Board) -> Score {
++        eval::set_root(root.stm());
++        self.stopped = false;
++        self.node_limit = None;
++        self.deadline = None;
++        self.hard = None;
++        self.td.nodes = 0;
++        self.td.keys.clear();
++        self.td.root_ply = 0;
++        self.search(root, 0, -INFINITY, INFINITY, 0, false, true, 0, Move::NONE)
++    }
++
+     pub fn go(
+         &mut self,
+         root: &Board,
+@@ -1907,16 +2004,26 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
+         // ---- whole-node pruning, all disabled in check, in PV nodes,
+         // and inside quiescence
+         if !in_q && !is_pv && !in_check {
++            #[cfg(feature = "nodedump")]
++            if excluded == Move::NONE {
++                crate::nodedump::record(b, depth, static_eval, alpha, beta, improving, ply);
++            }
+             // Reverse futility: if we are so far ahead that even conceding
+             // `margin * depth` leaves us above beta, assume the opponent has no
+             // way to claw it back at this depth.
+             if depth <= self.params.rfp_max_depth
+-                && prune_eval
+-                    - self.params.rfp_margin
+-                        * (depth * 1000 - improving as i32 * self.params.rfp_improving)
+-                        / 1000
+-                    >= beta
+                 && !eval::is_mate_score(beta)
++                && if self.params.rfp_learn > 0 {
++                    prune_eval >= beta
++                        && self.rfp_logit(b, depth, prune_eval - beta, static_eval, improving, ply, tt_eval.is_some())
++                            < self.rfp_thr(depth)
++                } else {
++                    prune_eval
++                        - self.params.rfp_margin
++                            * (depth * 1000 - improving as i32 * self.params.rfp_improving)
++                            / 1000
++                        >= beta
++                }
+             {
+                 return static_eval;
+             }
+diff --git a/src/wdleval.rs b/src/wdleval.rs
+index 64dbdec..17d2faf 100644
+--- a/src/wdleval.rs
++++ b/src/wdleval.rs
+@@ -1244,6 +1244,28 @@ impl WdlNet {
+         self.logits(tail, b, own, opp, &mut s)
+     }
+ 
++    /// The big tail's inner layers after a full forward pass, for
++    /// `chess nodelabel`: `mid`'s output in our ordering (`2d`), `up` after
++    /// its clamp (`2h`), `l2` after its clamp (`2h`), then the three logits.
++    /// A head fitted on these is one the engine can add for the cost of a
++    /// dot product, since every value here is already computed per eval.
++    pub fn inner(&self, b: &Board) -> Vec<f32> {
++        let (w, tail) = (self.width, &self.big);
++        let (d, h) = (tail.d, self.hidden);
++        let mut s = Scratch::new(w, d, h);
++        let mut acc = vec![0i16; 2 * w];
++        self.fill_colour(b, &mut acc);
++        let (wh, bl) = acc.split_at(w);
++        let (own, opp) = if b.stm() == Color::White { (wh, bl) } else { (bl, wh) };
++        let lg = self.logits(tail, b, own, opp, &mut s);
++        let mut v = Vec::with_capacity(2 * d + 4 * h + 3);
++        v.extend_from_slice(&s.cu[..2 * d]);
++        v.extend_from_slice(&s.hv[..2 * h]);
++        v.extend_from_slice(&s.zv[..2 * h]);
++        v.extend_from_slice(&lg);
++        v
++    }
++
+     /// Whether this file carries a quiescence tail for `--dual`. Without one
+     /// `--dual` keeps its old meaning (the quad net in quiescence).
+     pub fn has_small(&self) -> bool {
+@@ -1463,6 +1485,10 @@ pub fn resync_stats() -> (u64, u64, u64, u64) {
+ }
+ 
+ impl Evaluator for WdlEval {
++    fn l2_out(&self) -> Option<&[f32]> {
++        if self.off { None } else { Some(&self.s.zv[..2 * self.net.hidden]) }
++    }
++
+     fn evaluate(&mut self, b: &Board) -> Score {
+         let (net, w) = (self.net, self.net.width);
+         self.evals += 1;

@@ -153,13 +153,17 @@ macro_rules! params {
     };
 }
 
+/// The `eval_k` value that reproduces the net file's own scale exactly:
+/// `static_eval * 2885 / 2885` is the identity for every `Score`.
+pub const EVAL_K_UNITY: Score = 2885;
+
 params! {
 #[derive(Clone, Copy, Debug)]
 pub struct Params {
         > pricing: Pricing;
 
         /// Null move pruning is off below this depth.
-        pub nmp_min_depth = 3, 1, 12;
+        pub nmp_min_depth = 2, 1, 12;
         /// Plies the null-move search gives up before the depth term.
         pub nmp_base_reduction = 3, 0, 8;
         /// ...plus `depth / this`.
@@ -171,12 +175,18 @@ pub struct Params {
         /// Futility pruning applies at or below this depth. 0 disables it
         /// (default: off until measured). The mirror of RFP on the alpha
         /// side: if even gaining `fut_margin * depth` leaves us below alpha,
-        /// no quiet move reaches alpha at this depth. Captures can, so the
-        /// node returns the static eval as a fail-soft upper bound rather
-        /// than pruning outright — safe at a non-PV node, where any value
-        /// below alpha keeps the bound logic intact; the only cost of being
-        /// wrong is strength, not correctness.
-        pub fut_max_depth = 0, 0, 16;
+        /// no quiet move reaches alpha at this depth. This depth enables the
+        /// move-loop skip-quiets form below, which still searches every
+        /// capture and is NOT refuted (084 killed only the whole-node gate,
+        /// which now needs `fut_whole_node` as well).
+        pub fut_max_depth = 3, 0, 16;
+        /// Whole-node return-static gate: a second consumer of the futility
+        /// condition that returns the static eval for the entire node instead
+        /// of skipping quiets. PROXY-KILLED in 084 (+4.6..+22cp, monotone —
+        /// it forfeits the captures that recover), so this stays 0; it exists
+        /// only so the killed form and the live form can be told apart.
+        /// Never SPRT this on.
+        pub fut_whole_node = 0, 0, 1;
         /// Centipawns per ply of depth granted before futility gives up on
         /// reaching alpha.
         pub fut_margin = 100, 0, 600;
@@ -204,8 +214,26 @@ pub struct Params {
         /// same quantity with opposite signs, and only one of the two was
         /// tunable.
         pub check_extension = 1000, 0, 4000;
-        /// Delta pruning slack in quiescence, centipawns.
-        pub delta_margin = 100, 0, 1200;
+        /// Delta pruning slack in quiescence, centipawns. **1200 is the top
+        /// of the box, which is the rule switched off in all but name** — it
+        /// still fires only when the static eval is twelve pawns below alpha.
+        /// That is deliberate: the rule does not pay for itself. The level fan
+        /// is monotone over the whole box and never turns around (LEDGER 113,
+        /// 12000 games per cell at 1+0.01, vs this same binary at 200):
+        /// 150 −19.0 · 300 +22.4 · 400 +49.0 · 600 +67.6 · 800 +80.8 ·
+        /// 1200 +84.1, plateau from 600 up. Confirmed at the gate's own time
+        /// control: **+40.02 [35.02, 45.03]** over 6000 games at 8+0.08.
+        ///
+        /// The mechanism is not that pruning less buys accuracy at a price —
+        /// it is that the rule made the tree *bigger*. At fixed depth 9 on
+        /// m1-b1 the bench goes 179364 → 151742 nodes (−15.4%) at unchanged
+        /// nps, because qsearch does the same work (q captures +0.7%) and
+        /// returns better bounds, so the main search cuts off sooner (main
+        /// quiet −16%, main capture −22%).
+        ///
+        /// Kept as a tunable rather than deleted: the deletion is a different
+        /// change and nobody has played a game on it.
+        pub delta_margin = 1200, 0, 1200;
         /// Plies of quiescence allowed below the point the main search runs
         /// out of budget. 64 is unreachable in practice and reproduces an
         /// uncapped quiescence exactly.
@@ -231,6 +259,203 @@ pub struct Params {
         /// Stockfish reached when it deleted its skip table. Time-to-depth is
         /// a proxy; no SPRT has been run on this.
         pub smp_skip = 0, 0, 1;
+        /// Easy move: consecutive completed iterations with the same best
+        /// move and a stable score before the clock trusts the move. 0
+        /// disables it (default 2 since the 094 bundle gate). Time
+        /// management never touches a node-limited search, so this is
+        /// bench-exact at any setting — only games price it.
+        pub easy_stable = 2, 0, 8;
+        /// Score drift allowed between those iterations, centipawns.
+        pub easy_margin = 15, 0, 100;
+        /// Minimum completed depth before the easy-move shortcut applies.
+        pub easy_depth = 8, 1, 64;
+        /// When easy, the next iteration starts only below this percent of
+        /// the normal half-deadline gate (70 = 0.35 instead of 0.50).
+        pub easy_frac = 70, 5, 100;
+        /// Order in-check evasions by SEE instead of killer/history. 0 =
+        /// current ordering (default: off until measured). Captures, killers
+        /// and the TT move keep their slots; only the quiet-evasion order
+        /// changes, so the tree moves but the mechanism is one lookup.
+        pub qevade_see = 0, 0, 1;
+        /// Singular extensions: minimum depth for the verification search. 0
+        /// disables (default: off until measured). When a hash move looks
+        /// that much better than every alternative — a reduced search
+        /// without it fails low by more than `se_margin * depth` — the move
+        /// gets an extra ply. The one extension this engine has ever had is
+        /// checks; tactics that hang on one move are the other classical
+        /// case. Bench-exact at 0.
+        pub se_min_depth = 0, 0, 16;
+        /// Centipawns per ply of fail-low margin the verification must show
+        /// before a move counts as singular.
+        pub se_margin = 3, 0, 50;
+        /// Singular extensions: the stored entry's depth must be within this
+        /// many plies of the current depth. A stale bound from a much
+        /// shallower search says nothing about how singular the move is now.
+        pub se_depth_slack = 3, 0, 8;
+        /// Full-window search up to this depth; deeper iterations start with
+        /// a narrow window around the previous score and re-search on fail.
+        pub asp_full_depth = 4, 1, 12;
+        /// Aspiration window growth, percent: after each fail,
+        /// `delta = delta * this / 100`. 150 reproduces the old
+        /// `delta += delta / 2` exactly (must stay above 100, or the window
+        /// never grows and the loop never ends).
+        pub asp_growth = 150, 110, 400;
+        /// History bonus ceiling: `bonus = min(depth^2, this)`. The shape
+        /// (quadratic in depth) stays hardcoded — TU-7 owns shape variants —
+        /// this is the cap.
+        pub hist_cap = 1200, 0, 5000;
+        /// History gravity divisor: entries saturate toward ±this instead of
+        /// overflowing, so old information decays rather than dominating.
+        /// Shared with continuation history, which learns on the same events.
+        pub hist_grav = 16384, 1024, 65536;
+        /// Quiescence SEE threshold: after delta pruning passes a capture,
+        /// skip it unless it wins at least this much material by static
+        /// exchange. 0 is "don't drop exchanges".
+        pub qsee_thresh = 0, -500, 500;
+        /// Time manager: assumed moves to go when UCI sends no `movestogo`.
+        pub tm_moves_to_go = 24, 1, 100;
+        /// Increment share, percent of the increment added to the allotment.
+        pub tm_inc_pct = 90, 0, 100;
+        /// Never spend more than `time_left / this` on one move.
+        pub tm_cap_div = 3, 2, 8;
+        /// Movetime mode: keep this many milliseconds in hand (`movetime` is
+        /// a ceiling the GUI enforces, not a suggestion).
+        pub tm_movetime_margin = 20, 0, 500;
+        /// Start the next iteration only below this percent of the deadline.
+        /// 50 is "don't start what you can't finish".
+        pub tm_gate_pct = 50, 5, 100;
+        /// Eval readout scale, in tenths of a cp per K unit: 2885 is the net
+        /// file's own K = 288.5, so the default is the identity. A
+        /// search-side multiplier on every static eval — margins stay put,
+        /// so tuning this rescales every margin at once (TU-9). Does not
+        /// touch the net file, the TT's stored scores' meaning (they are
+        /// stored scaled, consistently), or the contempt/draw readouts in
+        /// `eval.rs`, which stay in net units.
+        pub eval_k = 2885, 1000, 6000;
+        /// SR-5a: RFP concedes `rfp_margin * (depth - improving * this/1000)`
+        /// — milli-plies of depth taken off the margin when the side to move
+        /// has improved on its static eval of two plies ago. 1000 is
+        /// Stockfish's shape. 0 disables (bench-exact).
+        pub rfp_improving = 0, 0, 4000;
+        /// SR-7: null-move reduction grows by `min((eval - beta) / this,
+        /// nmp_eval_max)` plies. 0 disables (bench-exact).
+        pub nmp_eval_div = 0, 0, 2000;
+        /// Cap on that extra null-move reduction, plies.
+        pub nmp_eval_max = 3, 0, 8;
+        /// SR-4 razoring: at non-PV nodes with `depth <= this` and
+        /// `eval + raz_margin * depth <= alpha`, a null-window quiescence
+        /// that also fails low is returned. Unlike 084's whole-node
+        /// futility it *searches* the captures that recover. 0 disables.
+        pub raz_max_depth = 0, 0, 8;
+        /// Centipawns per ply of depth for the razoring gate.
+        pub raz_margin = 250, 0, 2000;
+        /// SR-6 ProbCut: minimum depth. 0 disables (bench-exact). A capture
+        /// whose SEE clears `beta + pc_margin - eval`, confirmed first by
+        /// quiescence and then by a search `pc_reduction` plies shallower,
+        /// against `beta + pc_margin`, cuts the node.
+        pub pc_min_depth = 0, 0, 16;
+        pub pc_margin = 200, 0, 2000;
+        pub pc_reduction = 4, 1, 8;
+        /// Internal iterative *reduction*: a node with no hash move and at
+        /// least this depth loses a ply. 0 disables (bench-exact). Not IID
+        /// (074, which searched more); this searches less where ordering is
+        /// blind and lets the next visit find a hash move.
+        pub iir_min_depth = 3, 0, 16;
+        /// 1 = IIR only at PV and expected-cut nodes (Stockfish's gate).
+        pub iir_cut_only = 0, 0, 1;
+        /// SR-2d multi-cut: when the singular verification fails *high*
+        /// above beta, some other move also beats beta — return that bound.
+        pub se_multicut = 0, 0, 1;
+        /// SR-2d negative extension: when the verification fails high but
+        /// the hash score is at least beta, the hash move is searched this
+        /// many milli-plies shallower. 0 disables.
+        pub se_neg_ext = 0, 0, 3000;
+        /// Pruning eval refined by the hash bound: a lower bound above the
+        /// static eval, or an upper bound below it, replaces it for RFP,
+        /// null move and razoring. 0 off; 1 main-search entries only; 2 any
+        /// entry including quiescence ones.
+        pub tt_eval_adj = 0, 0, 2;
+        /// SR-15a: static eval is scaled by `(this - halfmove) / this`, so a
+        /// shuffling line drifts toward a draw score. 0 disables.
+        pub hmc_scale = 200, 0, 1000;
+        /// Capture history: `[piece][to][victim]`, learned on cutoffs like
+        /// history, added to MVV-LVA as `capthist / this`. 0 disables both
+        /// the update and the read (bench-exact).
+        pub capt_hist_div = 0, 0, 64;
+        /// Correction history (`--corr pawn`) updates only when the bound
+        /// agrees with the residual's sign. 0 = the phase-1 rule (every node).
+        pub corr_bound_aware = 0, 0, 1;
+        /// LC-2 two-stage gap: at nodes with at least this depth, every
+        /// non-hash child gets a null-window-ish quiescence search before the
+        /// loop (004: r² 0.03 for `move_gain`'s gap, 0.71 for this one). 0
+        /// disables (bench-exact). What the values feed is picked below.
+        pub lc2_min_depth = 0, 0, 16;
+        /// 1 = demote to the bottom of the list every move whose quiescence
+        /// value is `lc2_hang` below `min(static eval, alpha + 1)` — a
+        /// quiescence-strength SEE for quiet moves; the order among the rest
+        /// is untouched. (Ranking *by* the value instead was 7.7x the bench
+        /// nodes: it throws away history and killers.)
+        pub lc2_order = 0, 0, 1;
+        pub lc2_hang = 100, 0, 2000;
+        /// 1 = the price's gap is `best - qvalue` instead of the static
+        /// `move_gain` prediction. Needs `c_gap` non-zero to reach the price.
+        pub lc2_price = 0, 0, 1;
+        /// The probe window is `[alpha - this, alpha + 1]` from the parent's
+        /// side; values below it read as `alpha - this`. Width is the cost:
+        /// at 800 a probe was ~12 quiescence nodes (bench 5.4x), at 100 ~4.
+        pub lc2_win = 100, 50, 4000;
+        /// Follow-up history: continuation history keyed on *our* previous
+        /// move (two plies up), `[its piece][its to][piece][to]`, added to
+        /// quiet-move ordering and learned on the same events. 0 disables
+        /// both the update and the read (bench-exact).
+        pub conth2 = 0, 0, 1;
+        /// Hard limit as a percent of the soft allotment, still capped at
+        /// `time_left / tm_cap_div`. 100 = the old single deadline (an
+        /// iteration started just under the gate is usually cut unfinished).
+        pub tm_hard_pct = 500, 100, 600;
+        /// Soft-gate stretch per recent best-move change, percent. Changes
+        /// decay by half each iteration (Stockfish's `totBestMoveChanges`).
+        /// 0 disables.
+        pub tm_instab = 100, 0, 300;
+        /// Soft-gate stretch for a falling root score: per-mille of extra
+        /// time per centipawn dropped since the previous iteration, capped
+        /// at +100%. 0 disables.
+        pub tm_fall = 20, 0, 100;
+        /// 1 = predictive time manager (TM2): per-move target
+        /// `T = (t + mtg·inc) / mtg` with `mtg` = material on the board
+        /// (1/3/3/5/9, both sides, 78 at the start); the next iteration
+        /// starts only if `elapsed + dt_last²/dt_prev` fits under
+        /// `min(tm2_go_pct·T, t/tm2_cap_div)`; hard stop at
+        /// `min(tm2_hard_pct·T, t/tm2_cap_div)`. Ignores the gate, the
+        /// easy move and the stretches above. 0 = the soft/hard manager.
+        pub tm_mode = 0, 0, 1;
+        /// TM2: 1 = moves-to-go from material, 0 = `tm_moves_to_go`.
+        pub tm2_mat = 1, 0, 1;
+        /// TM2: floor on the material moves-to-go (KR v K would be 5).
+        pub tm2_mtg_min = 10, 1, 80;
+        /// TM2: moves-to-go is this percent of the material sum.
+        pub tm2_mat_pct = 100, 20, 200;
+        /// Soft/hard manager: if > 0, moves-to-go is this percent of the
+        /// material sum (floor `tm2_mtg_min`) instead of `tm_moves_to_go`.
+        /// 0 disables.
+        pub tm_mat_pct = 0, 0, 200;
+        /// TM2: start the next iteration only if its predicted finish is
+        /// under this percent of the target.
+        pub tm2_go_pct = 150, 50, 400;
+        /// TM2: hard stop, percent of the target.
+        pub tm2_hard_pct = 400, 100, 1000;
+        /// TM2: never plan past `time_left / this`, gate or hard stop.
+        pub tm2_cap_div = 2, 2, 8;
+        /// TM2: iterations up to this depth run without the prediction.
+        pub tm2_free_depth = 4, 2, 12;
+        /// SR-10: at the first quiescence ply (not in check), also search
+        /// quiet moves that give check and do not lose material by SEE.
+        /// 0 disables (bench-exact).
+        pub q_checks = 0, 0, 1;
+        /// SR-11: milli-plies of extension for a capture that recaptures on
+        /// the square the previous move captured on. Node-level, so unlike
+        /// the `c_recap` price (065) it reaches the first move. 0 disables.
+        pub recap_ext = 0, 0, 2000;
     }
 }
 
@@ -371,6 +596,20 @@ pub struct Ctx<'a> {
     pub full: i32,
     /// How the search got to this node. See `PathInfo`.
     pub prev: PathInfo,
+    /// The side to move has improved on its static eval of two plies ago.
+    pub improving: bool,
+    /// There was an eval two plies ago to compare with (not at plies 0-1,
+    /// not when either node was in check). Without it `improving` is false
+    /// by default, not by measurement.
+    pub impr_known: bool,
+    /// This node is expected to fail high (non-PV, reached as the kind of
+    /// child whose first move should cut).
+    pub cut_node: bool,
+    /// The hash move at this node is a capture.
+    pub tt_capture: bool,
+    /// Continuation-history score of this move (quiet moves only), the
+    /// half of the ordering signal the legacy `c_hist` term never saw.
+    pub conth: i32,
 }
 
 /// Declare a search feature once, and generate everything else.
@@ -475,7 +714,7 @@ features! {
     /// predicts; an SEE veto takes that to 8% (`library/004`). The one
     /// quantitative prediction that theory made, and the first feature to
     /// pass an SPRT: LEDGER 062/064.
-    c_see: Gap, Lin, Gated, 4000, -4000, 20000,
+    c_see: Gap, Lin, Gated, 2000, -4000, 20000,
           |c| !crate::eval::see(c.b, c.mv, 0);
     /// The move recaptures on the square the previous move captured on.
     /// Mid-exchange positions are where a shallow search is least reliable, so
@@ -548,6 +787,26 @@ features! {
     /// gated: nothing pays for it until it earns a coefficient.
     c_gives_check: Cost, Lin, Gated, 0, -8000, 8000,
           |c| c.b.make_move(c.mv).in_check();
+    /// SR-5b: the side to move has NOT improved on its static eval of two
+    /// plies ago (false in check or without an eval to compare). Moves at a
+    /// worsening node are less likely to lift alpha, so the sign is a
+    /// higher price.
+    c_notimpr: Gap, Lin, Free, 0, -4000, 4000,
+          |c| c.impr_known && !c.improving;
+    /// SR-8: this is an expected cut node. Its first move should cut, so a
+    /// later child's value is less likely to matter at the root.
+    c_cutnode: Cost, Lin, Free, 0, -4000, 4000,
+          |c| c.cut_node && !c.is_pv;
+    /// The hash move is a capture and this move is quiet: the position's
+    /// business is tactical, so a quiet alternative is less likely best.
+    c_ttcapt: Gap, Lin, Free, 0, -4000, 4000,
+          |c| c.tt_capture && c.mv.is_quiet();
+    /// Continuation history in the price, scaled like `c_hist`'s `h`
+    /// (`-score/64`, clamped to 256) but without its `>> 4`, so a
+    /// coefficient of ~6 weighs it the same as `c_hist = 100` weighs
+    /// history. Negative history costs more.
+    c_conth: Gap, Lin, Free, 0, -400, 400,
+          |c| (-c.conth / 64).clamp(-256, 256);
 }
 
 impl Pricing {
@@ -613,6 +872,17 @@ impl Pricing {
     }
 }
 
+/// Material on the board at 1/3/3/5/9, both sides: 78 at the start. The
+/// time managers read it as a moves-to-go estimate.
+fn material(b: &Board) -> u32 {
+    const VAL: [u32; 5] = [1, 3, 3, 5, 9];
+    [PieceType::Pawn, PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen]
+        .iter()
+        .zip(VAL)
+        .map(|(&pt, v)| b.pieces(pt).count() * v)
+        .sum()
+}
+
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Limits {
     pub depth: Option<u32>,
@@ -636,18 +906,18 @@ impl Limits {
     /// Returns the soft deadline. Simple but not silly: reserve for the moves
     /// still to come, add most of the increment, never spend more than a third
     /// of what is left.
-    fn allotment(&self, stm: usize) -> Option<Duration> {
+    fn allotment(&self, stm: usize, p: &Params) -> Option<Duration> {
         if self.infinite {
             return None;
         }
         if let Some(mt) = self.movetime {
-            return Some(Duration::from_millis(mt.saturating_sub(20)));
+            return Some(Duration::from_millis(mt.saturating_sub(p.tm_movetime_margin.max(0) as u64)));
         }
         let t = self.time[stm]?;
         let inc = self.inc[stm];
-        let mtg = self.movestogo.unwrap_or(30).max(1) as u64;
-        let budget = t / mtg + inc * 3 / 4;
-        Some(Duration::from_millis(budget.min(t / 3).max(5)))
+        let mtg = self.movestogo.unwrap_or(p.tm_moves_to_go.max(1) as u32).max(1) as u64;
+        let budget = t / mtg + (inc * p.tm_inc_pct.max(0) as u64) / 100;
+        Some(Duration::from_millis(budget.min(t / p.tm_cap_div.max(2) as u64).max(5)))
     }
 }
 
@@ -782,16 +1052,93 @@ fn corr_enabled() -> bool {
     CORR_ANY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Continuation history: what the previous move was predicts what replies
+/// well here. `[prev_piece][prev_to][piece][to]`, learned within one search
+/// like plain history. On by default since the 094 bundle gate;
+/// `--no-conth` / `$CHESS_CONTH=0` switches it off (the off-ramp the next
+/// gate's B arm needs). Off means one relaxed load per quiet move scored
+/// and bit-identical search (bench-exact), the same dormant-carriage deal
+/// as CORR above — except the default is on, so the bench moves with it.
+///
+/// The cheap O5/O6 forms (countermove `[side][prev_to]`, piece/to history)
+/// are both measured dead (ORDERING.md); this is the full Stockfish-shaped
+/// form, which is untried here.
+static CONTH_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Parse `--no-conth` / `$CHESS_CONTH=0` (on by default). Called once from
+/// `crate::init`. `--conth` / `$CHESS_CONTH=1` are accepted as no-ops, so
+/// the 094 command line keeps working; an explicit off beats them.
+pub fn init_conth() {
+    let off = std::env::args().any(|a| a == "--no-conth")
+        || matches!(std::env::var("CHESS_CONTH").as_deref(), Ok("0"));
+    if !off {
+        CONTH_ANY.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn conth_enabled() -> bool {
+    CONTH_ANY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// History persistence across moves (FX-1): `go_parallel` used to build a
+/// fresh `ThreadData` for every `go`, so history, killers, continuation
+/// history and the correction table started empty on each move. The UCI
+/// `Engine` now owns one `ThreadData` per thread and reuses it across moves;
+/// this flag picks the move-start rule. 0 rebuilds fresh tables every move;
+/// 1 persists everything unchanged (the default since the 094 bundle gate);
+/// 2 persists but halves history and conth at the start of each move; 3
+/// persists with killers cleared (killers are per-ply and refer to the
+/// previous root, so they may be noise). Node-limited searches always behave
+/// as 0 — bench stays exact and the tuner stays reproducible — whatever this
+/// says. Same binary for every arm of the SPRT; only the flag differs.
+static PERSIST_HIST: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+
+/// Parse `--persist-hist=N` / `$CHESS_PERSIST_HIST=N`, clamped to 0..=3.
+/// Parsed once per process; a match arm sets it on the engine command line.
+pub fn persist_mode() -> u8 {
+    *PERSIST_HIST.get_or_init(|| {
+        let mut mode: u8 = std::env::var("CHESS_PERSIST_HIST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        for a in std::env::args().skip(1) {
+            if let Some(v) = a.strip_prefix("--persist-hist=") {
+                if let Ok(n) = v.parse() {
+                    mode = n;
+                }
+            }
+        }
+        mode.min(3)
+    })
+}
+
 /// Per-thread state. Nothing here is shared, so Lazy SMP needs no locking.
 pub struct ThreadData {
     pub id: usize,
     killers: [[Move; 2]; MAX_PLY],
     /// `[side][from][to]`, incremented on quiet-move cutoffs.
     history: Box<[[[i32; 64]; 64]; 2]>,
+    /// Continuation history: `[prev_piece][prev_to][piece][to]`, ~147k
+    /// entries of gravity-bounded scores like `history`. Updated on the
+    /// same cutoff/malus events, read for quiet moves in `score_moves`.
+    /// Zero unless enabled (on by default; `--no-conth`).
+    conth: Box<[[[[i32; 64]; 6]; 64]; 6]>,
     /// Pawn-structure correction history (`library/015`): `[side][pawn_key &
     /// 16383]`, entries in ~cp Q8. Like history, learned within one search and
     /// forgotten after — no locking, no sharing, cleared per search.
     corr: Box<[[i16; 16384]; 2]>,
+    /// Capture history `[piece][to][victim]` (victim 6 = none, a quiet
+    /// promotion). Zero and never touched unless `capt_hist_div > 0`.
+    capth: Box<[[[i32; 7]; 64]; 6]>,
+    /// Follow-up history (`conth2`), same shape as `conth`.
+    conth2: Box<[[[[i32; 64]; 6]; 64]; 6]>,
+    /// Expected-cut flag per ply, written by the parent before it recurses
+    /// (same-ply re-entries — IID, singular, razoring — share it).
+    cut: [bool; MAX_PLY],
+    /// Static eval (with correction) per ply, `-INFINITY` in check. Read two
+    /// plies up for the improving flag.
+    ss_eval: [Score; MAX_PLY],
     pv: [[Move; MAX_PLY]; MAX_PLY],
     pv_len: [usize; MAX_PLY],
     /// See `PathInfo`. Boxed: 128 entries is 2 KB and `ThreadData` is already
@@ -844,7 +1191,12 @@ impl ThreadData {
             id,
             killers: [[Move::NONE; 2]; MAX_PLY],
             history: Box::new([[[0; 64]; 64]; 2]),
+            conth: Box::new([[[[0; 64]; 6]; 64]; 6]),
             corr: Box::new([[0; 16384]; 2]),
+            capth: Box::new([[[0; 7]; 64]; 6]),
+            conth2: Box::new([[[[0; 64]; 6]; 64]; 6]),
+            cut: [false; MAX_PLY],
+            ss_eval: [-INFINITY; MAX_PLY],
             pv: [[Move::NONE; MAX_PLY]; MAX_PLY],
             pv_len: [0; MAX_PLY],
             path: Box::new([PathInfo::default(); MAX_PLY]),
@@ -868,12 +1220,46 @@ impl ThreadData {
     pub fn clear(&mut self) {
         self.killers = [[Move::NONE; 2]; MAX_PLY];
         *self.history = [[[0; 64]; 64]; 2];
+        *self.conth = [[[[0; 64]; 6]; 64]; 6];
         *self.corr = [[0; 16384]; 2];
+        *self.capth = [[[0; 7]; 64]; 6];
+        *self.conth2 = [[[[0; 64]; 6]; 64]; 6];
         #[cfg(feature = "checkstats")]
         {
             self.probe_guard = 0;
         }
         *self.path = [PathInfo::default(); MAX_PLY];
+    }
+
+    /// FX-1 mode 2: halve the learned move-ordering tables at the start of
+    /// each move. Last move's ordering is a prior, not a verdict — halving
+    /// keeps the ranking while letting this move's cutoffs overwrite it.
+    /// The correction table is untouched: entries are position-keyed cp
+    /// values, not move scores, so there is no reason to decay them here.
+    pub fn halve_learned(&mut self) {
+        for s in self.history.iter_mut() {
+            for f in s.iter_mut() {
+                for x in f.iter_mut() {
+                    *x /= 2;
+                }
+            }
+        }
+        for p in self.conth.iter_mut() {
+            for t in p.iter_mut() {
+                for q in t.iter_mut() {
+                    for x in q.iter_mut() {
+                        *x /= 2;
+                    }
+                }
+            }
+        }
+    }
+
+    /// FX-1 mode 3: forget last move's killers while keeping the learned
+    /// tables. Killers name moves that cut off at a ply of the *previous*
+    /// root position; after the opponent's reply the position moved on.
+    pub fn clear_killers(&mut self) {
+        self.killers = [[Move::NONE; 2]; MAX_PLY];
     }
 }
 
@@ -895,6 +1281,9 @@ pub struct Searcher<'a, E: Evaluator> {
     params: Params,
     start: Instant,
     deadline: Option<Duration>,
+    /// Where `check_time` stops the search. Equal to `deadline` unless
+    /// `tm_hard_pct > 100`.
+    hard: Option<Duration>,
     node_limit: Option<u64>,
     /// The work ceiling in picoseconds, so the test is one integer compare.
     #[cfg(feature = "prof")]
@@ -913,6 +1302,7 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
             params,
             start: Instant::now(),
             deadline: None,
+            hard: None,
             node_limit: None,
             #[cfg(feature = "prof")]
             work_limit: None,
@@ -927,6 +1317,27 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
     /// TT and the killer tables, so depth N with the previous iterations is
     /// reached FASTER than depth N from scratch, because move ordering is that
     /// much better.
+    /// The learned RFP's logit of P(this node fails low at its depth), LEDGER
+    /// 119. Features and weights are `fitexport.py`'s, fitted on 493k nodes
+    /// sampled at this very block (`--features nodedump`) and labelled by the
+    /// node's own depth-`d` iteration of a 64k-node search. `g = eval - beta`,
+    /// `>= 0` here. `stale` says the static eval came from the hash, so the
+    /// evaluator's l2 buffer describes some other board: arm 2 re-evaluates.
+    /// A full-window quiescence search of `root`, from its side to move, with
+    /// `root`'s side as the contempt side. For `chess nodelabel`, which needs
+    /// the value the search would stand on before it spends any depth.
+    pub fn qsearch_value(&mut self, root: &Board) -> Score {
+        eval::set_root(root.stm());
+        self.stopped = false;
+        self.node_limit = None;
+        self.deadline = None;
+        self.hard = None;
+        self.td.nodes = 0;
+        self.td.keys.clear();
+        self.td.root_ply = 0;
+        self.search(root, 0, -INFINITY, INFINITY, 0, false, true, 0, Move::NONE)
+    }
+
     pub fn go(
         &mut self,
         root: &Board,
@@ -939,7 +1350,42 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
         // has to say whose search this is. Every helper thread sets the same
         // value, which is why it can be a plain global.
         eval::set_root(root.stm());
-        self.deadline = limits.allotment(root.stm().index());
+        self.deadline = limits.allotment(root.stm().index(), &self.params);
+        if self.params.tm_mat_pct > 0 && limits.movetime.is_none() && limits.movestogo.is_none() && !limits.infinite {
+            let us = root.stm().index();
+            if let Some(t) = limits.time[us] {
+                let p = &self.params;
+                let mtg = (material(root) * p.tm_mat_pct as u32 / 100).max(p.tm2_mtg_min.max(1) as u32) as u64;
+                let budget = t / mtg + (limits.inc[us] * p.tm_inc_pct.max(0) as u64) / 100;
+                self.deadline = Some(Duration::from_millis(budget.min(t / p.tm_cap_div.max(2) as u64).max(5)));
+            }
+        }
+        self.hard = self.deadline;
+        if self.params.tm_hard_pct > 100 && limits.movetime.is_none() {
+            if let (Some(d), Some(t)) = (self.deadline, limits.time[root.stm().index()]) {
+                let cap = Duration::from_millis(t / self.params.tm_cap_div.max(2) as u64);
+                self.hard = Some(d.mul_f64(self.params.tm_hard_pct as f64 / 100.0).min(cap).max(d));
+            }
+        }
+        // TM2's start limit, when it is on. It replaces the gate below and
+        // sets its own hard stop.
+        let mut tm2_go: Option<Duration> = None;
+        if self.params.tm_mode == 1 && limits.movetime.is_none() && !limits.infinite {
+            let us = root.stm().index();
+            if let Some(t) = limits.time[us] {
+                let p = &self.params;
+                let mtg = if p.tm2_mat == 1 {
+                    (material(root) * p.tm2_mat_pct.max(1) as u32 / 100).max(p.tm2_mtg_min.max(1) as u32)
+                } else {
+                    p.tm_moves_to_go.max(1) as u32
+                } as f64;
+                let target_ms = ((t as f64 + mtg * limits.inc[us] as f64) / mtg).max(5.0);
+                let cap_ms = t as f64 / p.tm2_cap_div.max(2) as f64;
+                let ms = |x: f64| Duration::from_secs_f64(x.max(1.0) / 1000.0);
+                tm2_go = Some(ms((target_ms * p.tm2_go_pct as f64 / 100.0).min(cap_ms)));
+                self.hard = Some(ms((target_ms * p.tm2_hard_pct as f64 / 100.0).min(cap_ms)));
+            }
+        }
         self.node_limit = limits.nodes;
         // The counter runs from zero each search, so the ceiling is absolute
         // rather than relative to whatever a previous search left behind.
@@ -951,6 +1397,12 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
         }
         self.stopped = false;
         self.td.nodes = 0;
+        // Per-search tallies, like the node counter above: a reused
+        // `ThreadData` (FX-1 persistence) must not carry last move's mix and
+        // utilisation into this move's numbers. No-op on a fresh table.
+        self.td.movemix = [0; 6];
+        self.td.util_searched = 0;
+        self.td.util_useful = 0;
         self.td.keys.clear();
         self.td.keys.extend_from_slice(history);
         self.td.root_ply = self.td.keys.len();
@@ -981,6 +1433,17 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
 
         let max_depth = limits.depth.unwrap_or(MAX_PLY as u32 - 1);
         let mut prev_score = 0;
+        // Easy move: how many consecutive completed iterations agree on the
+        // best move with a stable score. Dormant while `easy_stable` is 0.
+        let mut em_move = Move::NONE;
+        let mut em_score = 0;
+        let mut em_stable: u32 = 0;
+        // Instability: best-move changes, halved every iteration.
+        let mut changes = 0.0f64;
+        let mut last_move = Move::NONE;
+        // TM2: wall time of the last two completed iterations, seconds.
+        let mut iter_end = 0.0f64;
+        let mut dt_last = 0.0f64;
 
         for depth in 1..=max_depth {
             // Lazy SMP diversification: a helper skips some iterations so the
@@ -991,7 +1454,7 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
                 continue;
             }
             self.td.sel_depth = 0;
-            let score = if depth <= 4 {
+            let score = if depth <= self.params.asp_full_depth as u32 {
                 self.negamax(root, depth as i32 * PLY, -INFINITY, INFINITY, 0, true)
             } else {
                 self.aspiration(root, depth as i32 * PLY, prev_score)
@@ -1019,9 +1482,51 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
             if eval::is_mate_score(score) && depth as Score >= MATE_BOUND - score.abs() {
                 break;
             }
+            // Easy move: the same best move at sufficient depth with a score
+            // that is not drifting trusts the move and spends less clock.
+            // Only completed iterations count — a stopped one proved nothing.
+            if self.params.easy_stable > 0
+                && depth >= self.params.easy_depth as u32
+                && best.best_move == em_move
+                && (score - em_score).abs() <= self.params.easy_margin
+            {
+                em_stable += 1;
+            } else {
+                em_stable = 0;
+            }
+            if depth > 1 {
+                changes = changes * 0.5 + (best.best_move != last_move) as u32 as f64;
+            }
+            last_move = best.best_move;
+            let fall = if depth > 1 { (em_score - score).max(0) } else { 0 };
+            em_move = best.best_move;
+            em_score = score;
+            if let Some(go) = tm2_go {
+                // Predict the next iteration from the growth of the last two:
+                // dt_next = dt_last · (dt_last / dt_prev), never shrinking.
+                let now = self.start.elapsed().as_secs_f64();
+                let dt_prev = dt_last;
+                dt_last = now - iter_end;
+                iter_end = now;
+                if depth >= self.params.tm2_free_depth as u32 {
+                    let pred = dt_last * (dt_last / dt_prev.max(1e-6)).max(1.0);
+                    if now + pred > go.as_secs_f64() {
+                        break;
+                    }
+                }
+                continue;
+            }
             // Don't start an iteration we have no realistic chance of finishing.
             if let Some(d) = self.deadline {
-                if self.start.elapsed() > d.mul_f64(0.5) {
+                let base = self.params.tm_gate_pct as f64 / 100.0;
+                let mut stretch = 1.0 + changes * self.params.tm_instab as f64 / 100.0;
+                stretch *= 1.0 + (fall as f64 * self.params.tm_fall as f64 / 1000.0).min(1.0);
+                let gate = if self.params.easy_stable > 0 && em_stable >= self.params.easy_stable as u32 {
+                    d.mul_f64(base * stretch * self.params.easy_frac as f64 / 100.0)
+                } else {
+                    d.mul_f64(base * stretch)
+                };
+                if self.start.elapsed() > gate {
                     break;
                 }
             }
@@ -1048,7 +1553,7 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
             } else {
                 return score;
             }
-            delta += delta / 2;
+            delta = delta * self.params.asp_growth / 100;
         }
     }
 
@@ -1082,7 +1587,7 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
             self.shared.nodes.fetch_add(delta, Ordering::Relaxed);
             if self.shared.stop.load(Ordering::Relaxed) {
                 self.stopped = true;
-            } else if let Some(d) = self.deadline {
+            } else if let Some(d) = self.hard {
                 if self.start.elapsed() >= d {
                     self.stopped = true;
                 }
@@ -1144,13 +1649,19 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
         ply: usize,
         is_pv: bool,
     ) -> Score {
-        self.search(b, budget, alpha, beta, ply, is_pv, false, 0)
+        self.td.cut[ply] = false;
+        self.search(b, budget, alpha, beta, ply, is_pv, false, 0, Move::NONE)
     }
 
     /// One recursive function for both searches above. `in_q` picks the branch:
     /// full moves, pricing and the hash outside quiescence; captures, stand pat
     /// and the SEE filter inside it. Same tree as the two functions this
     /// replaces — `bench` proves it, not the comments.
+    ///
+    /// `excluded` removes one move from the loop. Only the singular-extension
+    /// verification uses it: the bound proved without a legal move is not a
+    /// bound on the real position, so an excluded search neither stores to
+    /// the hash nor extends further. `Move::NONE` everywhere else.
     #[allow(clippy::too_many_arguments)]
     fn search(
         &mut self,
@@ -1162,6 +1673,7 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
         is_pv: bool,
         in_q: bool,
         qd: i32,
+        excluded: Move,
     ) -> Score {
         if !in_q {
             self.td.pv_len[ply] = 0;
@@ -1204,7 +1716,7 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
         }
 
         if !in_q && budget <= 0 {
-            return self.search(b, 0, alpha, beta, ply, false, true, 0);
+            return self.search(b, 0, alpha, beta, ply, false, true, 0, Move::NONE);
         }
 
         // Two ply-valued views of the budget, and they round opposite ways on
@@ -1214,8 +1726,9 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
         // what we claim to have proved, so it rounds DOWN — never advertise
         // work that was not done. On whole-ply budgets the two coincide, which
         // is what makes the identity pricing byte-identical to the old search.
-        let depth = (budget + PLY - 1) / PLY;
-        let tt_depth = budget / PLY;
+        let mut depth = (budget + PLY - 1) / PLY;
+        let mut tt_depth = budget / PLY;
+        let cut_node = self.td.cut[ply];
 
         self.td.nodes += 1;
         #[cfg(feature = "prof")]
@@ -1259,10 +1772,18 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
         // is also what unlocks TT-move ordering inside quiescence.
         let mut tt_move = Move::NONE;
         let mut tt_eval = None;
+        // Saved for the singular-extension check below: the entry's own
+        // score, bound and proven depth. Probe-adjusted for ply already.
+        let mut tt_score = 0;
+        let mut tt_bound = crate::tt::Bound::None;
+        let mut tt_stored: i32 = -1;
         {
             let hit = zone!(self, Z::TtProbe, self.shared.tt.probe(b.key(), ply));
             if let Some(h) = &hit {
                 tt_move = h.mv;
+                tt_score = h.score;
+                tt_bound = h.bound;
+                tt_stored = h.depth as i32;
                 // Deliberately NOT tiered: a quiescence store's eval is the
                 // cheap net's, and the main search reuses it anyway — exactly
                 // as the base build reuses quiescence evals. Recomputing a
@@ -1292,6 +1813,27 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
             }
         }
 
+        // Internal iterative reduction (dormant unless `iir_min_depth > 0`).
+        // No hash move means ordering is blind here; search a ply shallower
+        // and let the next visit find the move this one stores.
+        if !in_q
+            && ply > 0
+            && excluded == Move::NONE
+            && self.params.iir_min_depth > 0
+            && tt_move == Move::NONE
+            && depth >= self.params.iir_min_depth
+            && (self.params.iir_cut_only == 0 || is_pv || cut_node)
+        {
+            budget -= PLY;
+            depth = (budget + PLY - 1) / PLY;
+            tt_depth = budget / PLY;
+        }
+
+        // What the hash stores: the evaluator's own number, before any
+        // search-side adjustment (the 50-move scaling depends on the path,
+        // not the key, so storing it scaled would compound on re-read). At
+        // default parameters it equals the static eval exactly.
+        let mut raw_eval: Score = 0;
         let static_eval = if in_check {
             #[cfg(feature = "checkstats")]
             if self.td.probe_guard == 0 {
@@ -1312,6 +1854,8 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
                 Some(e) => e,
                 None => zone!(self, Z::QEval, self.eval.evaluate(b)),
             };
+            raw_eval = s;
+            let s = self.hmc_adjust(b, s);
             // Standing pat: we are not obliged to capture, so the static eval
             // is a lower bound on what this node is worth. Store it — a later
             // quiescence node at this key with beta below it cuts off without
@@ -1320,7 +1864,7 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
                 zone!(
                     self,
                     Z::TtStore,
-                    self.shared.tt.store(b.key(), Move::NONE, s, s, crate::tt::Q_DEPTH, Bound::Lower, ply)
+                    self.shared.tt.store(b.key(), Move::NONE, s, raw_eval, crate::tt::Q_DEPTH, Bound::Lower, ply)
                 );
                 return s;
             }
@@ -1329,11 +1873,18 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
         } else {
             #[cfg(feature = "evalstats")]
             crate::evalstats::record(b, 1);
-            match tt_eval {
+            raw_eval = match tt_eval {
                 Some(e) => e,
                 None => zone!(self, Z::Eval, self.eval.evaluate(b)),
-            }
+            };
+            self.hmc_adjust(b, raw_eval)
         };
+        // The eval readout scale (TU-1 `eval_k`, default = identity): every
+        // static eval the search sees is in these units — stored evals,
+        // stand-pat bounds, pruning comparands — so one multiplier rescales
+        // every margin at once. Mate-distance and in-check sentinels pass
+        // through unchanged in value (the scale is exact at default).
+        let static_eval = static_eval * self.params.eval_k / EVAL_K_UNITY;
 
         // Correction history (library/015), phase 1: the eval plus what this
         // pawn structure has taught us about the eval's bias. Main search
@@ -1348,14 +1899,48 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
             static_eval
         };
 
+        // Improving: better than our own static eval two plies ago. Written
+        // for every main node that gets this far, read two plies down.
+        let mut improving = false;
+        let mut impr_known = false;
+        if !in_q {
+            self.td.ss_eval[ply] = if in_check { -INFINITY } else { corr_eval };
+            impr_known = !in_check && ply >= 2 && self.td.ss_eval[ply - 2] != -INFINITY;
+            improving = impr_known && corr_eval > self.td.ss_eval[ply - 2];
+        }
+        // The pruning eval: the corrected static eval, optionally tightened
+        // by a hash bound that says the true value lies beyond it.
+        let prune_eval = if self.params.tt_eval_adj > 0
+            && !in_q
+            && !in_check
+            && tt_bound != Bound::None
+            && !eval::is_mate_score(tt_score)
+            && (self.params.tt_eval_adj == 2 || tt_stored != crate::tt::Q_DEPTH as i32)
+            && ((tt_bound == Bound::Lower && tt_score > corr_eval)
+                || (tt_bound == Bound::Upper && tt_score < corr_eval)
+                || tt_bound == Bound::Exact)
+        {
+            tt_score
+        } else {
+            corr_eval
+        };
+
         // ---- whole-node pruning, all disabled in check, in PV nodes,
         // and inside quiescence
         if !in_q && !is_pv && !in_check {
+            #[cfg(feature = "nodedump")]
+            if excluded == Move::NONE {
+                crate::nodedump::record(b, depth, static_eval, alpha, beta, improving, ply);
+            }
             // Reverse futility: if we are so far ahead that even conceding
             // `margin * depth` leaves us above beta, assume the opponent has no
             // way to claw it back at this depth.
             if depth <= self.params.rfp_max_depth
-                && corr_eval - self.params.rfp_margin * depth >= beta
+                && prune_eval
+                    - self.params.rfp_margin
+                        * (depth * 1000 - improving as i32 * self.params.rfp_improving)
+                        / 1000
+                    >= beta
                 && !eval::is_mate_score(beta)
             {
                 return static_eval;
@@ -1365,19 +1950,100 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
             // exactly the zugzwang-prone case where "passing" is not a valid
             // lower bound on what a real move achieves.
             if depth >= self.params.nmp_min_depth
-                && corr_eval >= beta
+                && prune_eval >= beta
                 && b.has_non_pawn_material(b.stm())
             {
-                let r = self.params.nmp_base_reduction + depth / self.params.nmp_depth_divisor;
+                let mut r = self.params.nmp_base_reduction + depth / self.params.nmp_depth_divisor;
+                if self.params.nmp_eval_div > 0 {
+                    r += ((prune_eval - beta) / self.params.nmp_eval_div).min(self.params.nmp_eval_max);
+                }
+                self.td.cut[ply + 1] = !cut_node;
                 let nb = b.make_null();
                 self.td.path[ply + 1] = PathInfo { mv: Move::NONE, off_pv: self.td.path[ply].off_pv, off_us: self.td.path[ply].off_us, off_them: self.td.path[ply].off_them, off_us_n: self.td.path[ply].off_us_n, off_them_n: self.td.path[ply].off_them_n };
                 self.td.keys.push(nb.key());
                 let score =
-                    -self.search(&nb, budget - (r + 1) * PLY, -beta, -beta + 1, ply + 1, false, false, 0);
+                    -self.search(&nb, budget - (r + 1) * PLY, -beta, -beta + 1, ply + 1, false, false, 0, Move::NONE);
                 self.td.keys.pop();
                 if score >= beta {
                     // Don't return unproven mate scores from a null move.
                     return if eval::is_mate_score(score) { beta } else { score };
+                }
+            }
+
+            // Razoring (SR-4, dormant unless `raz_max_depth > 0`): hopelessly
+            // below alpha at low depth — ask quiescence, which does search
+            // the captures that recover, and believe it only if it agrees.
+            if self.params.raz_max_depth > 0
+                && depth <= self.params.raz_max_depth
+                && prune_eval + self.params.raz_margin * depth <= alpha
+                && !eval::is_mate_score(alpha)
+            {
+                let v = self.search(b, 0, alpha, alpha + 1, ply, false, true, 0, Move::NONE);
+                if self.stopped {
+                    return alpha;
+                }
+                if v <= alpha {
+                    return v;
+                }
+            }
+
+            // ProbCut (SR-6, dormant unless `pc_min_depth > 0`): a good
+            // capture that beats beta by a margin at reduced depth is taken as
+            // proof the full-depth search would too.
+            let pbeta = beta + self.params.pc_margin;
+            if self.params.pc_min_depth > 0
+                && depth >= self.params.pc_min_depth
+                && excluded == Move::NONE
+                && !eval::is_mate_score(beta)
+                && !eval::is_mate_score(pbeta)
+                && !(tt_stored != crate::tt::Q_DEPTH as i32
+                    && tt_bound != Bound::None
+                    && tt_stored >= depth - self.params.pc_reduction
+                    && tt_score < pbeta)
+            {
+                let mut caps = MoveList::new();
+                generate(b, GenType::Captures, &mut caps);
+                self.score_moves(b, &mut caps, tt_move, ply, false);
+                let child_budget = budget - self.params.pc_reduction * PLY;
+                for i in 0..caps.len() {
+                    let mv = caps.pick_best(i);
+                    if !eval::see(b, mv, pbeta - static_eval) {
+                        continue;
+                    }
+                    let nb = b.make_move(mv);
+                    self.shared.tt.prefetch(nb.key());
+                    self.td.path[ply + 1] = PathInfo {
+                        mv,
+                        off_pv: self.td.path[ply].off_pv + 1,
+                        off_us: self.td.path[ply].off_us | ((ply % 2 == 0) as u8),
+                        off_them: self.td.path[ply].off_them | ((ply % 2 == 1) as u8),
+                        off_us_n: (self.td.path[ply].off_us_n + (ply % 2 == 0) as u8).min(3),
+                        off_them_n: (self.td.path[ply].off_them_n + (ply % 2 == 1) as u8).min(3),
+                    };
+                    self.td.cut[ply + 1] = !cut_node;
+                    self.td.keys.push(nb.key());
+                    self.eval.push(&nb);
+                    let mut v = -self.search(&nb, 0, -pbeta, -pbeta + 1, ply + 1, false, true, 0, Move::NONE);
+                    if v >= pbeta && child_budget > 0 {
+                        v = -self.search(&nb, child_budget, -pbeta, -pbeta + 1, ply + 1, false, false, 0, Move::NONE);
+                    }
+                    self.eval.pop();
+                    self.td.keys.pop();
+                    if self.stopped {
+                        return alpha;
+                    }
+                    if v >= pbeta {
+                        self.shared.tt.store(
+                            b.key(),
+                            mv,
+                            v,
+                            raw_eval,
+                            (tt_depth - self.params.pc_reduction + 1).clamp(0, 254) as u8,
+                            Bound::Lower,
+                            ply,
+                        );
+                        return v;
+                    }
                 }
             }
 
@@ -1391,10 +2057,13 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
             // from above — monotonically bad, no interior optimum. Mechanism:
             // a node failing low is exactly where the search must find the
             // tactic that gets back, and returning static forfeits captures
-            // too. The standard form (skip quiets, still search captures)
+            // too. Gated behind `fut_whole_node` (default 0, never SPRT on)
+            // so the skip-quiets form below can be measured pure. The
+            // standard form (skip quiets, still search captures)
             // is a different mechanism and is NOT refuted by this — but it
             // needs move-loop surgery, not this gate. Do not SPRT this form.
             if self.params.fut_max_depth > 0
+                && self.params.fut_whole_node > 0
                 && depth <= self.params.fut_max_depth
                 && corr_eval + self.params.fut_margin * depth <= alpha
                 && !eval::is_mate_score(alpha)
@@ -1433,7 +2102,7 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
                 let mut step = PLY;
                 loop {
                     let probe = if step < cap { step } else { cap };
-                    let ps = self.search(b, probe, alpha, beta, ply, is_pv, false, 0);
+                    let ps = self.search(b, probe, alpha, beta, ply, is_pv, false, 0, excluded);
                     if self.stopped {
                         return alpha;
                     }
@@ -1448,6 +2117,43 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
                     }
                     step *= 2;
                 }
+            }
+        }
+
+        // ---- singular extension: one move far better than the rest earns
+        // more budget. Dormant while `se_min_depth` is 0 (bench-exact). A
+        // lower-bound hash entry proven near this depth says the hash move
+        // failed high; a half-budget search *without* it that still fails
+        // low by `se_margin * depth` says nothing else comes close. Excluded
+        // searches never nest, and mate scores stay out on both sides.
+        let mut se_ext = false;
+        let mut se_neg = false;
+        if !in_q
+            && ply > 0
+            && excluded == Move::NONE
+            && self.params.se_min_depth > 0
+            && depth >= self.params.se_min_depth
+            && tt_move != Move::NONE
+            && tt_bound == crate::tt::Bound::Lower
+            && tt_stored >= depth - self.params.se_depth_slack
+            && !eval::is_mate_score(tt_score)
+            && !eval::is_mate_score(beta)
+        {
+            let sbeta = tt_score - self.params.se_margin * depth;
+            let vs = self.search(b, (budget / 2).max(1), sbeta - 1, sbeta, ply, false, false, 0, tt_move);
+            if self.stopped {
+                return alpha;
+            }
+            // Never leak a probe PV: same reason as the IID ramp above.
+            self.td.pv_len[ply] = 0;
+            se_ext = vs < sbeta;
+            if !se_ext {
+                // Multi-cut: another move clears sbeta, and sbeta clears beta,
+                // so two moves beat beta — the node is a cut either way.
+                if self.params.se_multicut > 0 && sbeta >= beta {
+                    return sbeta;
+                }
+                se_neg = self.params.se_neg_ext > 0 && tt_score >= beta;
             }
         }
 
@@ -1468,13 +2174,57 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
             if in_check && moves.is_empty() {
                 return eval::mated_in(ply);
             }
-            zone!(self, Z::QOrder, self.score_moves(b, &mut moves, tt_move, ply));
+            if !in_check && qd == 0 && self.params.q_checks > 0 {
+                let mut all = MoveList::new();
+                generate(b, GenType::All, &mut all);
+                for i in 0..all.len() {
+                    let mv = all.get(i);
+                    if mv.is_quiet() && eval::see(b, mv, 0) && b.make_move(mv).in_check() {
+                        moves.push(mv);
+                    }
+                }
+            }
+            zone!(self, Z::QOrder, self.score_moves(b, &mut moves, tt_move, ply, in_check));
         } else {
             zone!(self, Z::Gen, generate(b, GenType::All, &mut moves));
             if moves.is_empty() {
                 return if in_check { eval::mated_in(ply) } else { eval::draw_score(b.stm()) };
             }
-            zone!(self, Z::Order, self.score_moves(b, &mut moves, tt_move, ply));
+            zone!(self, Z::Order, self.score_moves(b, &mut moves, tt_move, ply, in_check));
+        }
+        // LC-2: quiescence value of every non-hash child, from our side.
+        let mut lc2_vals: Vec<(Move, Score)> = Vec::new();
+        if !in_q
+            && self.params.lc2_min_depth > 0
+            && depth >= self.params.lc2_min_depth
+            && !in_check
+            && excluded == Move::NONE
+            && alpha > -MATE_BOUND
+            && alpha < MATE_BOUND
+        {
+            let w = self.params.lc2_win;
+            let (lo, hi) = (alpha - w, alpha + 1);
+            lc2_vals.reserve(moves.len());
+            for i in 0..moves.len() {
+                let mv = moves.get(i);
+                if mv == tt_move {
+                    continue;
+                }
+                let nb = b.make_move(mv);
+                self.td.path[ply + 1] = PathInfo { mv, ..self.td.path[ply] };
+                self.td.keys.push(nb.key());
+                self.eval.push(&nb);
+                let v = -self.search(&nb, 0, -hi, -lo, ply + 1, false, true, 0, Move::NONE);
+                self.eval.pop();
+                self.td.keys.pop();
+                if self.stopped {
+                    return alpha;
+                }
+                lc2_vals.push((mv, v.clamp(lo, hi)));
+                if self.params.lc2_order > 0 && v + self.params.lc2_hang < static_eval.min(hi) {
+                    moves.set_score(i, moves.score(i) - (1 << 23));
+                }
+            }
         }
 
         if in_q {
@@ -1503,7 +2253,7 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
                             false
                         } else {
                             // Skip captures that lose material outright.
-                            eval::see(b, mv, 0)
+                            eval::see(b, mv, self.params.qsee_thresh)
                         }
                     });
                     if !keep {
@@ -1513,6 +2263,14 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
 
                 self.td.movemix[3 + if mv.is_promotion() { 2 } else if mv.is_capture() { 1 } else { 0 }] += 1;
                 let nb = zone!(self, Z::QMake, b.make_move(mv));
+                // The main loop writes a full `PathInfo` on descent; quiescence
+                // never did, leaving `path[ply+1].mv` stale from an earlier
+                // main-search node at the same ply. Anything reading the route
+                // (continuation history today) would then index on a move from
+                // a different position. One move store per q-node fixes the
+                // invariant "path is written on the way down" everywhere; the
+                // off-PV fields at q plies stay zero and nobody reads them.
+                self.td.path[ply + 1].mv = mv;
                 #[cfg(feature = "movedump")]
                 crate::movedump::record(b, &nb, mv, 1);
                 #[cfg(feature = "hyst")]
@@ -1521,7 +2279,7 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
                 // accumulator work (LEDGER 038), so it needs the incremental path
                 // more than the main search does, not less.
                 zone!(self, Z::QPush, self.eval.push(&nb));
-                let score = -self.search(&nb, 0, -beta, -alpha, ply + 1, false, true, qd + 1);
+                let score = -self.search(&nb, 0, -beta, -alpha, ply + 1, false, true, qd + 1, Move::NONE);
                 zone!(self, Z::QPop, self.eval.pop());
                 if self.stopped {
                     return alpha;
@@ -1559,7 +2317,7 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
                     b.key(),
                     best_move,
                     best,
-                    if in_check { 0 } else { static_eval },
+                    if in_check { 0 } else { raw_eval },
                     crate::tt::Q_DEPTH,
                     q_bound,
                     ply,
@@ -1588,6 +2346,10 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
         // change (the history penalty stops accumulating past it) for no
         // measured gain. See LEDGER 041.
         let mut quiets_tried: Vec<Move> = Vec::new();
+        let ch_on = self.params.capt_hist_div > 0;
+        let mut capts_tried: Vec<Move> = Vec::new();
+        let tt_capture = tt_move != Move::NONE && tt_move.is_capture();
+        let use_conth_price = self.params.pricing.feat.c_conth != 0 && conth_enabled();
         let n = moves.len();
 
         let price = self.params.pricing;
@@ -1607,6 +2369,33 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
             let mv = moves.pick_best(i);
             let quiet = mv.is_quiet();
 
+            // Singular verification searches one move down.
+            if mv == excluded {
+                continue;
+            }
+
+            // Futility, skip-quiets form (shares `fut_max_depth`/`fut_margin`
+            // with the proxy-killed whole-node gate above, which additionally
+            // needs `fut_whole_node` — 0 disables both, so this is
+            // bench-exact by default). A quiet that cannot reach
+            // alpha at this depth is not searched, but every capture still
+            // is: the tactic that gets back survives. Never skips the first
+            // move (something must set best_score) and never at PV nodes,
+            // in check, or against mate scores.
+            if i > 0
+                && quiet
+                && !is_pv
+                && !in_check
+                && !in_q
+                && self.params.fut_max_depth > 0
+                && depth <= self.params.fut_max_depth
+                && static_eval + self.params.fut_margin * depth <= alpha
+                && !eval::is_mate_score(alpha)
+                && best_score > -MATE_BOUND
+            {
+                continue;
+            }
+
             // ---- price the move, before paying to make it
             let (mut ev_gap, mut ev_hist) = (0, 0);
             let cost = if i == 0 {
@@ -1623,6 +2412,11 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
                         || best_score < -MATE_BOUND
                     {
                         0
+                    } else if self.params.lc2_price > 0 && !lc2_vals.is_empty() {
+                        match lc2_vals.iter().find(|e| e.0 == mv) {
+                            Some(&(_, v)) => best_score - v,
+                            None => best_score - static_eval - eval::move_gain(b, mv),
+                        }
                     } else {
                         best_score - static_eval - eval::move_gain(b, mv)
                     };
@@ -1638,6 +2432,8 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
                     let f = Feats::extract(&price.feat, &Ctx {
                         b, mv, rank: i, depth, ply, gap, hist, is_pv, in_check,
                         full, prev: self.td.path[ply],
+                        improving, impr_known, cut_node, tt_capture,
+                        conth: if quiet && use_conth_price { self.conth_bonus(b, mv, ply) } else { 0 },
                     });
                     (price.price(&f, i, depth, gap, hist, is_pv, full), gap, hist)
                 });
@@ -1655,6 +2451,27 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
             // had — a search that never terminates. `MAX_PLY` would eventually
             // catch it, but only after the move was already lost on time.
             let child = (full - cost).min(budget - 1);
+            // Singular move: the verification above proved nothing else comes
+            // close, so spend an extra ply here. Clamped into the same strict
+            // decrease — an extension that could hand back the full budget
+            // is how searches stop terminating.
+            let child = if se_ext && mv == tt_move {
+                (child + PLY).min(budget - 1)
+            } else if se_neg && mv == tt_move {
+                child - self.params.se_neg_ext * PLY / 1000
+            } else {
+                child
+            };
+            let child = if self.params.recap_ext > 0
+                && mv.is_capture()
+                && self.td.path[ply].mv != Move::NONE
+                && self.td.path[ply].mv.is_capture()
+                && self.td.path[ply].mv.to() == mv.to()
+            {
+                (child + self.params.recap_ext * PLY / 1000).min(budget - 1)
+            } else {
+                child
+            };
 
             // Priced out of the search entirely. This is late move pruning,
             // except the threshold is a price rather than a move index — and it
@@ -1698,23 +2515,30 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
             self.td.keys.push(nb.key());
             zone!(self, Z::Push, self.eval.push(&nb));
 
+            // Expected node types, Stockfish's convention: the first child of
+            // a PV node is PV; the first child of a cut node is an all node
+            // and vice versa; a reduced null-window probe expects to cut.
             let mut score;
             if i == 0 {
-                score = -self.search(&nb, child, -beta, -alpha, ply + 1, is_pv, false, 0);
+                self.td.cut[ply + 1] = !is_pv && !cut_node;
+                score = -self.search(&nb, child, -beta, -alpha, ply + 1, is_pv, false, 0, Move::NONE);
             } else {
                 // Search at the price we set; if it beats alpha anyway the price
                 // was wrong, so buy the full search back.
-                score = -self.search(&nb, child, -alpha - 1, -alpha, ply + 1, false, false, 0);
+                self.td.cut[ply + 1] = cost > 0 || !cut_node;
+                score = -self.search(&nb, child, -alpha - 1, -alpha, ply + 1, false, false, 0, Move::NONE);
                 if score > alpha && cost > 0 {
                     // The price was wrong and the search just proved it. Pay
                     // again at full budget. This is the free precision signal.
                     researched = true;
                     let n0 = self.td.nodes;
-                    score = -self.search(&nb, full, -alpha - 1, -alpha, ply + 1, false, false, 0);
+                    self.td.cut[ply + 1] = !cut_node;
+                    score = -self.search(&nb, full, -alpha - 1, -alpha, ply + 1, false, false, 0, Move::NONE);
                     research_nodes = self.td.nodes - n0;
                 }
                 if score > alpha && score < beta {
-                    score = -self.search(&nb, full, -beta, -alpha, ply + 1, is_pv, false, 0);
+                    self.td.cut[ply + 1] = false;
+                    score = -self.search(&nb, full, -beta, -alpha, ply + 1, is_pv, false, 0, Move::NONE);
                 }
             }
 
@@ -1739,6 +2563,9 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
                                 Z::Hist,
                                 self.update_quiet_heuristics(b, mv, depth, ply, &quiets_tried)
                             );
+                        }
+                        if ch_on {
+                            self.update_capture_history(b, mv, depth, &capts_tried);
                         }
                         did_cutoff = true;
                     }
@@ -1773,6 +2600,8 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
             }
             if quiet {
                 quiets_tried.push(mv);
+            } else if ch_on {
+                capts_tried.push(mv);
             }
         }
 
@@ -1783,19 +2612,25 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
         } else {
             Bound::Upper
         };
-        zone!(
-            self,
-            Z::TtStore,
-            self.shared.tt.store(
-                b.key(),
-                best_move,
-                best_score,
-                if in_check { 0 } else { static_eval },
-                tt_depth.clamp(0, 255) as u8,
-                bound,
-                ply,
-            )
-        );
+        // An excluded (singular-verification) search bounds the wrong
+        // position — one legal move down — so it stores nothing. The probe
+        // above still reads: entries stored with the move available stay
+        // valid bounds for the search without it.
+        if excluded == Move::NONE {
+            zone!(
+                self,
+                Z::TtStore,
+                self.shared.tt.store(
+                    b.key(),
+                    best_move,
+                    best_score,
+                    if in_check { 0 } else { raw_eval },
+                    tt_depth.clamp(0, 255) as u8,
+                    bound,
+                    ply,
+                )
+            );
+        }
         // Runtime adaptation: only when we have an exact value (window not clipped),
         // otherwise best_score is a bound, not a value.
         if !in_check && bound == Bound::Exact {
@@ -1807,7 +2642,15 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
         // so updating from it would teach the table to agree with itself.
         // Mate scores carry no residual information. The TT keeps the raw
         // eval; the correction applies at read time, so old entries stay valid.
-        if corr_enabled() && !in_check && !in_q && !eval::is_mate_score(best_score) {
+        // `corr_bound_aware = 1` skips the updates whose sign the bound cannot
+        // vouch for: a fail-high below the eval, or a fail-low above it. A
+        // fail-soft bound is only a bound, and without this an all-node's
+        // upper bound (often far below the truth) teaches the table that the
+        // eval is too optimistic.
+        let corr_ok = self.params.corr_bound_aware == 0
+            || !((bound == Bound::Lower && best_score <= static_eval)
+                || (bound == Bound::Upper && best_score >= static_eval));
+        if corr_enabled() && corr_ok && excluded == Move::NONE && !in_check && !in_q && !eval::is_mate_score(best_score) {
             let idx = (b.pawn_key() & 16383) as usize;
             let e = &mut self.td.corr[b.stm().index()][idx];
             // Deeper nodes earn more say; one update stays a few percent of
@@ -1865,7 +2708,7 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
             let nb = b.make_move(*mv);
             // Full-window reply, mirroring how a generated check would be
             // searched if Q2 put it in the move list.
-            let s = -self.search(&nb, 0, -beta, -alpha, ply + 1, false, true, qd + 1);
+            let s = -self.search(&nb, 0, -beta, -alpha, ply + 1, false, true, qd + 1, Move::NONE);
             if self.stopped {
                 aborted = true;
                 break;
@@ -1884,13 +2727,22 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
     /// Move ordering. Getting this right is worth more than any pruning
     /// heuristic: alpha-beta visits `b^(d/2)` nodes with perfect ordering and
     /// `b^d` with none, so ordering is the difference between depth 8 and 16.
-    fn score_moves(&self, b: &Board, moves: &mut MoveList, tt_move: Move, ply: usize) {
+    fn score_moves(&self, b: &Board, moves: &mut MoveList, tt_move: Move, ply: usize, in_check: bool) {
         const TT_BONUS: i32 = 1 << 24;
         const CAPTURE_BONUS: i32 = 1 << 22;
         const KILLER_BONUS: i32 = 1 << 21;
         // O1: exchanges that lose material sort here — below killers, above
         // history. MVV-LVA alone puts a losing QxP above every quiet.
         const BAD_CAPTURE_BONUS: i32 = 1 << 20;
+        // Q1 (`qevade_see`): quiet evasions that hold material sort here —
+        // above history, below losing captures. Losing evasions sort at the
+        // bottom, below all of history.
+        const EVADE_OK_BONUS: i32 = 1 << 19;
+        const EVADE_BAD_BONUS: i32 = -(1 << 19);
+        let qevade = self.params.qevade_see > 0 && in_check;
+        let use_conth = conth_enabled();
+        let ch_div = self.params.capt_hist_div;
+        let use_conth2 = self.params.conth2 > 0;
 
         for i in 0..moves.len() {
             let mv = moves.get(i);
@@ -1912,16 +2764,64 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
                 } else {
                     0
                 };
-                CAPTURE_BONUS + eval::SEE_VALUE[victim] * 16 - eval::SEE_VALUE[attacker] + promo
+                let ch = if ch_div > 0 { self.td.capth[attacker][mv.to().index()][victim] / ch_div } else { 0 };
+                CAPTURE_BONUS + eval::SEE_VALUE[victim] * 16 - eval::SEE_VALUE[attacker] + promo + ch
                     + if eval::see(b, mv, 0) { 0 } else { BAD_CAPTURE_BONUS - CAPTURE_BONUS }
             } else if mv == self.td.killers[ply][0] {
                 KILLER_BONUS + 1
             } else if mv == self.td.killers[ply][1] {
                 KILLER_BONUS
+            } else if qevade {
+                if eval::see(b, mv, 0) { EVADE_OK_BONUS } else { EVADE_BAD_BONUS }
             } else {
-                self.td.history[b.stm().index()][mv.from().index()][mv.to().index()]
+                let h = self.td.history[b.stm().index()][mv.from().index()][mv.to().index()];
+                h + if use_conth { self.conth_bonus(b, mv, ply) } else { 0 }
+                    + if use_conth2 { self.conth2_bonus(b, mv, ply) } else { 0 }
             };
             moves.set_score(i, s);
+        }
+    }
+
+    /// Continuation bonus for a quiet move: what replies to the previous
+    /// move scored here before. Zero unless enabled. Missing pieces (never
+    /// at a real node — the previous move's target always holds our piece —
+    /// but cheap to guard) read as no information, never as a crash.
+    #[inline]
+    fn conth_bonus(&self, b: &Board, mv: Move, ply: usize) -> i32 {
+        let prev = self.td.path[ply].mv;
+        if prev == Move::NONE {
+            return 0;
+        }
+        let (pp, pc) = (b.piece_at(prev.to()), b.piece_at(mv.from()));
+        if pp.is_none() || pc.is_none() {
+            return 0;
+        }
+        self.td.conth[pp.piece_type().index()][prev.to().index()][pc.piece_type().index()][mv.to().index()]
+    }
+
+    /// Our previous move (two plies up) and the piece that made it, if that
+    /// piece is still ours on its target square.
+    #[inline]
+    fn followup_key(&self, b: &Board, ply: usize) -> Option<(usize, usize)> {
+        if ply < 1 {
+            return None;
+        }
+        let m2 = self.td.path[ply - 1].mv;
+        if m2 == Move::NONE {
+            return None;
+        }
+        let p = b.piece_at(m2.to());
+        if p.is_none() || p.color() != b.stm() {
+            return None;
+        }
+        Some((p.piece_type().index(), m2.to().index()))
+    }
+
+    #[inline]
+    fn conth2_bonus(&self, b: &Board, mv: Move, ply: usize) -> i32 {
+        match (self.followup_key(b, ply), b.piece_at(mv.from())) {
+            (Some((pp, pt)), pc) if pc.is_some() => self.td.conth2[pp][pt][pc.piece_type().index()][mv.to().index()],
+            _ => 0,
         }
     }
 
@@ -1940,16 +2840,94 @@ impl<'a, E: Evaluator> Searcher<'a, E> {
             self.td.killers[ply][0] = mv;
         }
         let side = b.stm().index();
-        let bonus = (depth * depth).min(1200);
+        let bonus = (depth * depth).min(self.params.hist_cap);
         let h = &mut self.td.history[side][mv.from().index()][mv.to().index()];
-        // Gravity: entries saturate toward +/-16384 instead of overflowing, so
-        // old information decays instead of dominating forever.
-        *h += bonus - *h * bonus / 16384;
+        // Gravity: entries saturate toward ±`hist_grav` instead of
+        // overflowing, so old information decays instead of dominating forever.
+        *h += bonus - *h * bonus / self.params.hist_grav;
         // Penalise the quiets that were tried and failed, or history would only
         // ever record which moves are common, not which are good.
         for &q in tried {
             let h = &mut self.td.history[side][q.from().index()][q.to().index()];
-            *h += -bonus - *h * bonus / 16384;
+            *h += -bonus - *h * bonus / self.params.hist_grav;
+        }
+        if self.params.conth2 > 0 {
+            if let Some((pp, pt)) = self.followup_key(b, ply) {
+                let g = self.params.hist_grav;
+                let pc = b.piece_at(mv.from());
+                if pc.is_some() {
+                    let e = &mut self.td.conth2[pp][pt][pc.piece_type().index()][mv.to().index()];
+                    *e += bonus - *e * bonus / g;
+                }
+                for &q in tried {
+                    let qpc = b.piece_at(q.from());
+                    if qpc.is_some() {
+                        let e = &mut self.td.conth2[pp][pt][qpc.piece_type().index()][q.to().index()];
+                        *e += -bonus - *e * bonus / g;
+                    }
+                }
+            }
+        }
+        // Continuation history learns on the same events, keyed by the reply
+        // pair. Skipped unless enabled (one relaxed load above).
+        if conth_enabled() {
+            let prev = self.td.path[ply].mv;
+            if prev != Move::NONE {
+                let (pp, pc) = (b.piece_at(prev.to()), b.piece_at(mv.from()));
+                if pp.is_some() && pc.is_some() {
+                    let e = &mut self.td.conth[pp.piece_type().index()][prev.to().index()][pc.piece_type().index()][mv.to().index()];
+                    *e += bonus - *e * bonus / self.params.hist_grav;
+                    for &q in tried {
+                        let qpc = b.piece_at(q.from());
+                        if qpc.is_some() {
+                            let e = &mut self.td.conth[pp.piece_type().index()][prev.to().index()][qpc.piece_type().index()][q.to().index()];
+                            *e += -bonus - *e * bonus / self.params.hist_grav;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// SR-15a: scale an eval toward zero as the 50-move counter climbs.
+    /// Identity while `hmc_scale` is 0.
+    #[inline]
+    fn hmc_adjust(&self, b: &Board, e: Score) -> Score {
+        let k = self.params.hmc_scale;
+        if k == 0 || eval::is_mate_score(e) {
+            return e;
+        }
+        e * (k - (b.halfmove() as i32).min(k)) / k
+    }
+
+    /// Capture-history index: `[moving piece][to][victim]`, victim 6 for a
+    /// promotion onto an empty square.
+    #[inline]
+    fn capth_idx(b: &Board, mv: Move) -> (usize, usize, usize) {
+        let victim = if mv.is_ep() {
+            PieceType::Pawn.index()
+        } else {
+            let p = b.piece_at(mv.to());
+            if p.is_some() { p.piece_type().index() } else { 6 }
+        };
+        (b.piece_at(mv.from()).piece_type().index(), mv.to().index(), victim)
+    }
+
+    /// Capture history learns on every cutoff: the move that cut (if a
+    /// capture) gains, the captures tried before it lose. Same bonus shape and
+    /// gravity as quiet history.
+    fn update_capture_history(&mut self, b: &Board, mv: Move, depth: i32, tried: &[Move]) {
+        let bonus = (depth * depth).min(self.params.hist_cap);
+        let g = self.params.hist_grav;
+        if !mv.is_quiet() {
+            let (p, t, v) = Self::capth_idx(b, mv);
+            let e = &mut self.td.capth[p][t][v];
+            *e += bonus - *e * bonus / g;
+        }
+        for &q in tried {
+            let (p, t, v) = Self::capth_idx(b, q);
+            let e = &mut self.td.capth[p][t][v];
+            *e += -bonus - *e * bonus / g;
         }
     }
 
@@ -2004,6 +2982,48 @@ pub fn score_to_uci(s: Score) -> String {
 /// different nodes and can return different moves. So `bench`, the tuner and
 /// any node-limited search stay single-threaded — a node limit is the tuner's
 /// unit of work and it has to be exactly reproducible.
+/// Make `td` ready for one more `go` with `threads` searchers under persist
+/// `mode` (see `persist_mode`): grow one entry per thread, then apply the
+/// mode's move-start rule. Mode 0 drops everything and rebuilds fresh —
+/// today's behaviour, and what node-limited searches always get. Modes 1..3
+/// reuse the tables the last search learned. Pure over the vec, so tests can
+/// check every mode without running a search.
+pub fn prepare_td(td: &mut Vec<ThreadData>, threads: usize, mode: u8) {
+    let n = threads.max(1);
+    match mode {
+        0 => {
+            td.clear();
+            for i in 0..n {
+                td.push(ThreadData::new(i));
+            }
+        }
+        1 => {
+            while td.len() < n {
+                let id = td.len();
+                td.push(ThreadData::new(id));
+            }
+        }
+        2 => {
+            while td.len() < n {
+                let id = td.len();
+                td.push(ThreadData::new(id));
+            }
+            for t in td.iter_mut().take(n) {
+                t.halve_learned();
+            }
+        }
+        _ => {
+            while td.len() < n {
+                let id = td.len();
+                td.push(ThreadData::new(id));
+            }
+            for t in td.iter_mut().take(n) {
+                t.clear_killers();
+            }
+        }
+    }
+}
+
 pub fn go_parallel<E, F>(
     shared: &Shared,
     root: &Board,
@@ -2013,18 +3033,29 @@ pub fn go_parallel<E, F>(
     threads: usize,
     make_eval: F,
     info: Option<InfoFn>,
+    td: &mut Vec<ThreadData>,
 ) -> SearchResult
 where
     E: Evaluator,
     F: Fn() -> E + Sync,
 {
     let threads = threads.max(1);
+    // `prepare_td` is the caller's job (the UCI engine applies the persist
+    // mode there); this only guarantees the indexing below is in range, so a
+    // caller that manages its own tables cannot go out of bounds.
+    while td.len() < threads {
+        let id = td.len();
+        td.push(ThreadData::new(id));
+    }
     shared.stop.store(false, Ordering::Relaxed);
     shared.nodes.store(0, Ordering::Relaxed);
 
     if threads == 1 {
-        let mut s = Searcher::new(shared, ThreadData::new(0), make_eval(), params);
-        return s.go(root, history, limits, info);
+        let owned = std::mem::replace(&mut td[0], ThreadData::new(0));
+        let mut s = Searcher::new(shared, owned, make_eval(), params);
+        let r = s.go(root, history, limits, info);
+        td[0] = s.td;
+        return r;
     }
 
     // Helpers get no depth ceiling. If the caller asked for `go depth 20` the
@@ -2037,17 +3068,25 @@ where
 
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(threads - 1);
-        for id in 1..threads {
+        // Disjoint halves, so the helpers can borrow their tables while the
+        // main thread uses its own — no locking, same deal as before, except
+        // the tables now survive the search instead of being dropped with it.
+        let (first, rest) = td.split_at_mut(1);
+        for slot in rest.iter_mut().take(threads - 1) {
             let eval = make_eval();
             let hl = helper_limits;
             handles.push(scope.spawn(move || {
-                let mut s = Searcher::new(shared, ThreadData::new(id), eval, params);
+                let owned = std::mem::replace(slot, ThreadData::new(0));
+                let mut s = Searcher::new(shared, owned, eval, params);
                 s.go(&root, history, &hl, None);
+                *slot = s.td;
             }));
         }
 
-        let mut main = Searcher::new(shared, ThreadData::new(0), make_eval(), params);
+        let owned = std::mem::replace(&mut first[0], ThreadData::new(0));
+        let mut main = Searcher::new(shared, owned, make_eval(), params);
         let res = main.go(&root, history, limits, info);
+        first[0] = main.td;
 
         // The helpers have no reason of their own to stop.
         shared.stop.store(true, Ordering::Relaxed);
@@ -2056,4 +3095,114 @@ where
         }
         res
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::board::START_FEN;
+    use crate::eval::PstEval;
+
+    fn dirty_td() -> Vec<ThreadData> {
+        let mut td = vec![ThreadData::new(0)];
+        let t = &mut td[0];
+        t.history[0][0][0] = 100;
+        t.history[1][63][63] = -7;
+        t.conth[0][0][0][0] = 50;
+        t.corr[0][0] = 12;
+        t.killers[0] = [crate::chess_move::Move::NONE; 2];
+        td
+    }
+
+    fn table_sums(t: &ThreadData) -> (i64, i64, i64) {
+        let h = t.history.iter().flatten().flatten().map(|&x| x as i64).sum();
+        let c = t
+            .conth
+            .iter()
+            .flatten()
+            .flatten()
+            .flatten()
+            .map(|&x| x as i64)
+            .sum();
+        let k = t.corr.iter().flatten().map(|&x| x as i64).sum();
+        (h, c, k)
+    }
+
+    #[test]
+    fn prepare_td_mode0_rebuilds_fresh() {
+        let mut td = dirty_td();
+        prepare_td(&mut td, 2, 0);
+        assert_eq!(td.len(), 2);
+        for (i, t) in td.iter().enumerate() {
+            assert_eq!(t.id, i);
+            assert_eq!(table_sums(t), (0, 0, 0), "mode 0 must drop everything");
+        }
+    }
+
+    #[test]
+    fn prepare_td_mode1_persists_everything() {
+        let mut td = dirty_td();
+        prepare_td(&mut td, 1, 1);
+        assert_eq!(table_sums(&td[0]), (93, 50, 12));
+        // Grows with fresh ids when the thread count rises.
+        prepare_td(&mut td, 3, 1);
+        assert_eq!(td.len(), 3);
+        assert_eq!(td[2].id, 2);
+        assert_eq!(table_sums(&td[0]), (93, 50, 12));
+    }
+
+    #[test]
+    fn prepare_td_mode2_halves_ordering_tables_only() {
+        let mut td = dirty_td();
+        prepare_td(&mut td, 1, 2);
+        // Rust integer division truncates toward zero: -7/2 == -3.
+        assert_eq!(table_sums(&td[0]), (100 / 2 - 7 / 2, 25, 12));
+        assert_eq!(td[0].history[0][0][0], 50);
+        assert_eq!(td[0].history[1][63][63], -3);
+    }
+
+    #[test]
+    fn prepare_td_mode3_clears_killers_keeps_tables() {
+        use crate::chess_move::{Move, MoveList};
+        use crate::movegen::{generate, GenType};
+        let mut td = dirty_td();
+        // Plant a real killer so the test checks removal, not just NONEs.
+        let b = Board::from_fen(START_FEN).unwrap();
+        let mut list = MoveList::new();
+        generate(&b, GenType::All, &mut list);
+        let m = list.get(0);
+        assert_ne!(m, Move::NONE);
+        td[0].killers[3] = [m, m];
+        prepare_td(&mut td, 1, 3);
+        assert!(td[0].killers.iter().flatten().all(|&k| k == Move::NONE));
+        assert_eq!(table_sums(&td[0]), (93, 50, 12));
+    }
+
+    #[test]
+    fn search_learns_into_reused_tables() {
+        crate::init();
+        let b = Board::from_fen(START_FEN).unwrap();
+        let shared = Shared::new(16);
+        let limits = Limits { depth: Some(4), ..Default::default() };
+        let mut td = Vec::new();
+        prepare_td(&mut td, 1, 0);
+        let r = go_parallel(&shared, &b, &[], &limits, Params::default(), 1, || PstEval, None, &mut td);
+        assert_ne!(r.best_move, crate::chess_move::Move::NONE);
+        // A real search cuts off, and cutoffs write history — so a nonzero
+        // table afterwards proves the search learned into the reused vec.
+        let learned: i64 = td[0]
+            .history
+            .iter()
+            .flatten()
+            .flatten()
+            .map(|&x| x.abs() as i64)
+            .sum();
+        assert!(learned > 0, "depth-4 startpos search should learn history");
+        // The second search runs on the same tables without complaint, and
+        // mode 0 afterwards drops all of it again.
+        let r2 = go_parallel(&shared, &b, &[], &limits, Params::default(), 1, || PstEval, None, &mut td);
+        assert_ne!(r2.best_move, crate::chess_move::Move::NONE);
+        prepare_td(&mut td, 1, 0);
+        assert_eq!(table_sums(&td[0]), (0, 0, 0));
+    }
 }

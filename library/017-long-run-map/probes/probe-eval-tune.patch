@@ -1,0 +1,125 @@
+--- ./src/tune.rs	2026-09-14 00:05:29.452481909 +0200
++++ src/tune.rs	2026-09-15 03:57:08.958826279 +0200
+@@ -402,7 +402,7 @@
+ fn search_once(shared: &Shared, b: &Board, budget: Budget, params: Params) -> (Move, Score, u32, u64, u64, u64) {
+     shared.tt.clear();
+     shared.stop.store(false, std::sync::atomic::Ordering::Relaxed);
+-    let mut s = Searcher::new(shared, ThreadData::new(0), DefaultEval::default(), params);
++    let mut s = Searcher::new(shared, ThreadData::new(0), probe::ProbeEval::new(), params);
+     let r = s.go(b, &[], &budget.limits(), None);
+     (r.best_move, r.score, r.depth, r.nodes, s.td.util_searched, s.td.util_useful)
+ }
+@@ -651,6 +651,7 @@
+         }
+     });
+ 
++    probe::finish();
+     let (regret, sq, agree, off, depth, nodes, searched, useful) = *totals.lock().unwrap();
+     let n = labels.len().max(1) as f64;
+     let mean = regret / n;
+@@ -1278,3 +1279,105 @@
+     }
+     Ok(out)
+ }
++
++/// PROBE (scratch copy only): wraps DefaultEval, forwards everything, and
++/// records (a) which keys reach `evaluate`, (b) how many incremental
++/// accumulator updates a lazy scheme would need under three cache variants.
++pub mod probe {
++    use crate::board::Board;
++    use crate::eval::{Evaluator, Score};
++    use crate::qeval::DefaultEval;
++    use std::collections::HashSet;
++    use std::sync::{Mutex, OnceLock};
++
++    static PREV: OnceLock<HashSet<u64>> = OnceLock::new();
++    // evals, hit_prev, hit_any, pushes, upd_none, upd_prev, upd_any
++    pub static STATS: Mutex<[u64; 7]> = Mutex::new([0; 7]);
++    static DUMP: Mutex<Vec<u64>> = Mutex::new(Vec::new());
++    thread_local! {
++        static SEEN: std::cell::RefCell<HashSet<u64>> = std::cell::RefCell::new(HashSet::new());
++    }
++
++    fn prev() -> &'static HashSet<u64> {
++        PREV.get_or_init(|| {
++            let mut s = HashSet::new();
++            if let Ok(p) = std::env::var("PROBE_PREV") {
++                let bytes = std::fs::read(p).unwrap();
++                for c in bytes.chunks_exact(8) {
++                    s.insert(u64::from_le_bytes(c.try_into().unwrap()));
++                }
++            }
++            s
++        })
++    }
++
++    pub struct ProbeEval {
++        inner: DefaultEval,
++        level: usize,
++        comp: [Vec<bool>; 3],
++        st: [u64; 7],
++        keys: Vec<u64>,
++    }
++
++    impl ProbeEval {
++        pub fn new() -> Self {
++            ProbeEval { inner: DefaultEval::default(), level: 0,
++                comp: [vec![true], vec![true], vec![true]], st: [0; 7], keys: Vec::new() }
++        }
++    }
++
++    impl Drop for ProbeEval {
++        fn drop(&mut self) {
++            let mut g = STATS.lock().unwrap();
++            for i in 0..7 { g[i] += self.st[i]; }
++            if std::env::var("PROBE_DUMP").is_ok() {
++                DUMP.lock().unwrap().extend_from_slice(&self.keys);
++            }
++        }
++    }
++
++    pub fn finish() {
++        let g = STATS.lock().unwrap();
++        eprintln!("PROBE evals={} hit_prev={} hit_any={} pushes={} upd_none={} upd_prev={} upd_any={}",
++            g[0], g[1], g[2], g[3], g[4], g[5], g[6]);
++        let uniq: HashSet<u64> = DUMP.lock().unwrap().iter().copied().collect();
++        eprintln!("PROBE unique_keys_dumped={}", uniq.len());
++        if let Ok(p) = std::env::var("PROBE_DUMP") {
++            let mut out = Vec::with_capacity(uniq.len() * 8);
++            for k in uniq { out.extend_from_slice(&k.to_le_bytes()); }
++            std::fs::write(p, out).unwrap();
++        }
++    }
++
++    impl Evaluator for ProbeEval {
++        fn evaluate(&mut self, b: &Board) -> Score {
++            let k = b.key();
++            self.st[0] += 1;
++            let hp = prev().contains(&k);
++            let ha = hp || SEEN.with(|s| s.borrow().contains(&k));
++            if hp { self.st[1] += 1; }
++            if ha { self.st[2] += 1; }
++            let hits = [false, hp, ha];
++            for v in 0..3 {
++                if !hits[v] {
++                    let mut j = self.level;
++                    while !self.comp[v][j] { self.st[4 + v] += 1; self.comp[v][j] = true; j -= 1; }
++                }
++            }
++            SEEN.with(|s| { s.borrow_mut().insert(k); });
++            if std::env::var_os("PROBE_DUMP").is_some() { self.keys.push(k); }
++            self.inner.evaluate(b)
++        }
++        fn push(&mut self, b: &Board) {
++            self.st[3] += 1;
++            self.level += 1;
++            for v in 0..3 {
++                if self.comp[v].len() <= self.level { self.comp[v].push(false); } else { self.comp[v][self.level] = false; }
++            }
++            self.inner.push(b)
++        }
++        fn pop(&mut self) { self.level -= 1; self.inner.pop() }
++        fn set_small(&mut self, s: bool) { self.inner.set_small(s) }
++        fn observe(&mut self, b: &Board, p: Score, a: Score, q: bool) { self.inner.observe(b, p, a, q) }
++    }
++}

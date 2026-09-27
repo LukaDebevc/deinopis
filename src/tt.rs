@@ -188,7 +188,7 @@ impl TranspositionTable {
             let old_raw = ((old_data >> 48) & 0xFF) as u8;
             let old_age = ((old_data >> 58) & 0x3F) as u8;
             let sem = |d: u8| if d == Q_DEPTH { -1i32 } else { d as i32 };
-            if bound != Bound::Exact && old_age == (age & 0x3F) && sem(old_raw) > sem(depth) + 3 {
+            if (bound != Bound::Exact || depth == Q_DEPTH) && old_age == (age & 0x3F) && sem(old_raw) > sem(depth) + 3 {
                 return;
             }
         }

@@ -516,8 +516,29 @@ struct Tail {
     head: Layer,
     /// `[2*hidden][3]`, input-major, no bias.
     skiph: Vec<f32>,
-    /// `[NROWS][3]`.
+    /// `[NROWS][PSQ]` — three live floats per row, padded to a 16-byte stride.
+    ///
+    /// At stride 3 a row starts at `i * 12`, so 12 of every 64 rows straddle a
+    /// cache line and cost two line touches instead of one. The gather is
+    /// 27 random rows per evaluation, and pinning it to one hot row measured
+    /// **76.1 ns -> 34.0 ns**: 42 ns of psqt is the scattered read, not the
+    /// adds. At stride 4 every row is 16-byte aligned and lies inside one
+    /// line. The padding float is never read, so every sum is unchanged and
+    /// the bench fingerprint stays 219718 (LEDGER 105).
     psqt: Vec<f32>,
+}
+
+/// Floats per psqt row in memory: three live, one pad. See `Tail::psqt`.
+const PSQ: usize = 4;
+
+/// Widen a `[NROWS][3]` psqt block read from the file into `[NROWS][PSQ]`.
+fn pad_psqt(flat: Vec<f32>) -> Vec<f32> {
+    let rows = flat.len() / 3;
+    let mut out = vec![0f32; rows * PSQ];
+    for i in 0..rows {
+        out[i * PSQ..i * PSQ + 3].copy_from_slice(&flat[i * 3..i * 3 + 3]);
+    }
+    out
 }
 
 struct Rdr<'a> {
@@ -656,7 +677,7 @@ fn tail_body(
         Vec::new()
     };
     let psqt = if flags & FLAG_PSQT != 0 {
-        r.vec(NROWS * 3)?
+        pad_psqt(r.vec(NROWS * 3)?)
     } else {
         Vec::new()
     };
@@ -734,7 +755,7 @@ impl WdlNet {
             Vec::new()
         };
         let psqt = if flags & FLAG_PSQT != 0 {
-            r.vec(NROWS * 3)?
+            pad_psqt(r.vec(NROWS * 3)?)
         } else {
             Vec::new()
         };
@@ -1028,9 +1049,20 @@ impl WdlNet {
             let mut pt_ = [0f32; 3];
             for (&x, &y) in f.iter().zip(g.iter()).take(n) {
                 let (i, j) = (x as usize, y as usize);
+                // SAFETY: `i` and `j` are feature indices, both < NROWS by
+                // construction in `features_into`, and `psqt` is NROWS * PSQ
+                // long whenever FLAG_PSQT is set. The bound is statically
+                // known; the check is not, and it sits in the gather this
+                // stage is made of.
+                let (ru, rt) = unsafe {
+                    (
+                        tail.psqt.get_unchecked(i * PSQ..i * PSQ + 3),
+                        tail.psqt.get_unchecked(j * PSQ..j * PSQ + 3),
+                    )
+                };
                 for k in 0..3 {
-                    pu[k] += tail.psqt[i * 3 + k];
-                    pt_[k] += tail.psqt[j * 3 + k];
+                    pu[k] += ru[k];
+                    pt_[k] += rt[k];
                 }
             }
             for k in 0..3 {
@@ -1210,6 +1242,28 @@ impl WdlNet {
         let (wh, bl) = acc.split_at(w);
         let (own, opp) = if b.stm() == Color::White { (wh, bl) } else { (bl, wh) };
         self.logits(tail, b, own, opp, &mut s)
+    }
+
+    /// The big tail's inner layers after a full forward pass, for
+    /// `chess nodelabel`: `mid`'s output in our ordering (`2d`), `up` after
+    /// its clamp (`2h`), `l2` after its clamp (`2h`), then the three logits.
+    /// A head fitted on these is one the engine can add for the cost of a
+    /// dot product, since every value here is already computed per eval.
+    pub fn inner(&self, b: &Board) -> Vec<f32> {
+        let (w, tail) = (self.width, &self.big);
+        let (d, h) = (tail.d, self.hidden);
+        let mut s = Scratch::new(w, d, h);
+        let mut acc = vec![0i16; 2 * w];
+        self.fill_colour(b, &mut acc);
+        let (wh, bl) = acc.split_at(w);
+        let (own, opp) = if b.stm() == Color::White { (wh, bl) } else { (bl, wh) };
+        let lg = self.logits(tail, b, own, opp, &mut s);
+        let mut v = Vec::with_capacity(2 * d + 4 * h + 3);
+        v.extend_from_slice(&s.cu[..2 * d]);
+        v.extend_from_slice(&s.hv[..2 * h]);
+        v.extend_from_slice(&s.zv[..2 * h]);
+        v.extend_from_slice(&lg);
+        v
     }
 
     /// Whether this file carries a quiescence tail for `--dual`. Without one

@@ -14,6 +14,10 @@
 //! Every line is verified legal by a unit test, so a typo here is a test
 //! failure, not a corrupted match.
 
+use crate::board::{Board, START_FEN};
+use crate::chess_move::MoveList;
+use crate::movegen::{generate, GenType};
+
 /// Built-in book, as UCI move sequences from the start position.
 pub const LINES: &[&str] = &[
     // --- 1.e4 e5
@@ -34,7 +38,12 @@ pub const LINES: &[&str] = &[
     "e2e4 c7c5 c2c3 d7d5 e4d5 d8d5",           // Alapin
     // --- other semi-open
     "e2e4 e7e6 d2d4 d7d5 b1c3 g8f6",       // French, Classical
-    "e2e4 e7e6 d2d4 d7d5 e4e5 c7c5",       // French, Advance
+    // 4...Qb6 rather than stopping at 3...c5: from the shorter line the
+    // engine walks into Na4 Qa5+ Nc3 Qb6 and repeats -- 146 of 280 games
+    // in one R3 cell were the *same* 24-ply draw, and the line drew 80%.
+    // Measured over 60 self-games at 0.5+0.005: 63% distinct -> 100%,
+    // draws 70% -> 38%.
+    "e2e4 e7e6 d2d4 d7d5 e4e5 c7c5 c2c3 d8b6", // French, Advance
     "e2e4 c7c6 d2d4 d7d5 b1c3 d5e4",       // Caro-Kann
     "e2e4 c7c6 d2d4 d7d5 e4e5 c8f5",       // Caro-Kann, Advance
     "e2e4 d7d5 e4d5 d8d5 b1c3 d5a5",       // Scandinavian
@@ -67,25 +76,122 @@ pub const LINES: &[&str] = &[
     "b2b3 e7e5 c1b2 b8c6 e2e3 g8f6",       // Larsen
 ];
 
-/// Parse the built-in book into move lists.
-pub fn builtin() -> Vec<Vec<String>> {
-    LINES.iter().map(|l| split(l)).collect()
+/// One opening: a start position and the moves played from it.
+///
+/// Two shapes, because the two book formats in the world are different things.
+/// A line of UCI moves starts from the initial position and *is* a sequence of
+/// moves, so the PGN it produces is an ordinary game. An EPD/FEN line names a
+/// position directly and carries no move history at all — the game starts
+/// there, the PGN needs `[FEN]`/`[SetUp]` tags, and its move numbering starts
+/// from the FEN's own fullmove counter rather than from 1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Opening {
+    pub start_fen: String,
+    pub moves: Vec<String>,
 }
 
-/// Load a book from a file: one line per opening, UCI moves separated by
-/// spaces. Blank lines and `#` comments are ignored.
-pub fn load(path: &str) -> Result<Vec<Vec<String>>, String> {
+impl Opening {
+    /// True when the game starts from the initial position, i.e. the PGN needs
+    /// no `[FEN]` tag and numbers its moves from 1.
+    pub fn from_startpos(&self) -> bool {
+        self.start_fen == START_FEN
+    }
+}
+
+/// Parse the built-in book into openings.
+pub fn builtin() -> Vec<Opening> {
+    LINES.iter().map(|l| Opening { start_fen: START_FEN.to_string(), moves: split(l) }).collect()
+}
+
+/// The 4000-line book every match uses unless `--book` says otherwise.
+///
+/// It is compiled in rather than read from disk because the binary gets copied
+/// to the cluster on its own, and a default that depends on a file sitting
+/// beside it is the same failure that made `chess bench` report two different
+/// node counts depending on whether `quad.nnue` was there.
+///
+/// Why 4000 lines and not the 43 of `builtin`: the harness computes
+/// `SE = sqrt(var(pair scores) / n_pairs)`, which assumes pairs are
+/// independent. With 43 openings and 3000 pairs each line is replayed ~70
+/// times, and any change worth different amounts in different openings makes
+/// that assumption false -- measured design effect 3.27 at R1, so the printed
+/// interval was 1.8x too narrow. With more lines than pairs nothing repeats
+/// and the printed SE is the honest one. LEDGER 111 and 112.
+pub fn default_book() -> Vec<Opening> {
+    const LICH: &str = include_str!("../books/lich.epd");
+    LICH.lines()
+        .filter_map(|l| {
+            let l = l.split('#').next().unwrap_or("").trim();
+            if l.is_empty() { None } else { Some(parse_line(l).expect("bad line in books/lich.epd")) }
+        })
+        .collect()
+}
+
+/// Load a book from a file. Two formats, detected per line:
+///
+/// * **UCI moves** — `e2e4 e7e5 g1f3`, played from the initial position.
+/// * **EPD / FEN** — `rnbq.../... w KQkq - 0 1`, the game starts there.
+///
+/// The formats are told apart by the `/` that every FEN's piece placement has
+/// and no UCI move can contain, so one file cannot be read as the other by
+/// accident. EPD opcodes after the position (`;` in Stockfish's books, `[0.0]`
+/// in lichess's) are ignored, as are blank lines and `#` comments.
+///
+/// Every line is validated here rather than mid-match: a book that cannot be
+/// parsed is a setup mistake, and finding it 40 minutes into a run costs the
+/// run. FEN lines are additionally checked to be legal positions with a move
+/// available, which is what `every_book_line_is_legal` does for the built-in.
+pub fn load(path: &str) -> Result<Vec<Opening>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-    let lines: Vec<Vec<String>> = text
-        .lines()
-        .map(|l| l.split('#').next().unwrap_or("").trim())
-        .filter(|l| !l.is_empty())
-        .map(split)
-        .collect();
-    if lines.is_empty() {
+    let mut out = Vec::new();
+    for (n, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        out.push(parse_line(line).map_err(|e| format!("{path}:{}: {e}", n + 1))?);
+    }
+    if out.is_empty() {
         return Err(format!("{path}: no opening lines"));
     }
-    Ok(lines)
+    Ok(out)
+}
+
+/// One book line, either format. Public so a caller can validate a single
+/// line without writing a file.
+pub fn parse_line(line: &str) -> Result<Opening, String> {
+    // `generate` reads the magic tables, which return EMPTY before they are
+    // built -- so an uninitialised caller would see every slider vanish and
+    // every position look stalemated. `Once`-guarded, so this is free after the
+    // first call and correct on the zeroth.
+    crate::attacks::init();
+    let first = line.split_whitespace().next().unwrap_or("");
+    if !first.contains('/') {
+        return Ok(Opening { start_fen: START_FEN.to_string(), moves: split(line) });
+    }
+    // An EPD record is a FEN whose last two fields may be missing, followed by
+    // opcodes. Cut the opcodes off first: `;` starts them in Stockfish's books,
+    // `[` in lichess's (`... - 0 3 [0.0]`).
+    let body = line
+        .split(';').next().unwrap_or("")
+        .split('[').next().unwrap_or("")
+        .trim();
+    let f: Vec<&str> = body.split_whitespace().collect();
+    if f.len() < 4 {
+        return Err(format!("FEN needs at least 4 fields, got {}: '{body}'", f.len()));
+    }
+    // EPD omits the halfmove and fullmove counters; a FEN has them. Take them
+    // only when they really are numbers, so a stray opcode cannot become one.
+    let hm = f.get(4).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0).min(100);
+    let fm = f.get(5).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).max(1);
+    let fen = format!("{} {} {} {} {hm} {fm}", f[0], f[1], f[2], f[3]);
+    let board = Board::from_fen(&fen)?;
+    let mut list = MoveList::new();
+    generate(&board, GenType::All, &mut list);
+    if list.is_empty() {
+        return Err(format!("position has no legal move: '{fen}'"));
+    }
+    Ok(Opening { start_fen: fen, moves: Vec::new() })
 }
 
 fn split(line: &str) -> Vec<String> {

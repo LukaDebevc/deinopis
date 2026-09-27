@@ -45,7 +45,8 @@ MATCH OPTIONS
                               sets both arms; --threads-a/--threads-b override
                               per arm (e.g. SMP 6v1: --threads-a 6)
   --hash MB                  per engine                  (default 32)
-  --book <file>              UCI opening lines, one per line
+  --book <file>              opening book: UCI move lines, or EPD/FEN
+                             positions, one per line (detected per line)
   --pgn <file>               write the games
   --name-a/--name-b <name>    PGN arm tags (default: each engine's id name;
                               identical tags are qualified [A]/[B]. Pass these
@@ -212,6 +213,7 @@ fn main() {
         Some("params") => params_cmd(&args[1..]),
         Some("features") => features_cmd(),
         Some("fendump") => fen_dump(&args[1..]),
+        Some("nodelabel") => node_label(&args[1..]),
         _ => print!("{HELP}"),
     }
 }
@@ -299,6 +301,75 @@ fn fen_dump(rest: &[String]) {
             out += 1;
         }
     }
+}
+
+/// `chess nodelabel IN OUT [--nodes N] [--hash MB]` — label the nodes
+/// `--features nodedump` sampled from the tree, for the uncertainty-head probe.
+///
+/// Per input line (the dump's TSV), one output line in `OUT.tsv`:
+/// the seven dump columns, then `static q vfinal dfinal nodes best best_cap
+/// mate v1 .. v12` -- every score from the node's side to move, with that side
+/// as the contempt side, `v_d` the score of completed iteration `d` of one
+/// `--nodes`-bounded search (`nan` past the last), `best_cap` whether that
+/// search's best move captures. `OUT.f32` gets the net's inner layers
+/// (`WdlNet::inner`) as little-endian f32, one fixed-width row per line.
+/// Each position gets a fresh search and a cleared hash, so a label does not
+/// depend on which positions came before it.
+fn node_label(rest: &[String]) {
+    use std::io::{BufRead, Write};
+    let (Some(inp), Some(outp)) = (rest.first(), rest.get(1)) else {
+        eprintln!("usage: chess nodelabel IN OUT [--nodes N] [--hash MB] (needs --wdl or $CHESS_WDL)");
+        std::process::exit(2);
+    };
+    let flag = |k: &str, d: u64| {
+        rest.iter().position(|a| a == k).and_then(|i| rest.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(d)
+    };
+    let nodes = flag("--nodes", 65536);
+    let Some(net) = chess::wdleval::net() else {
+        eprintln!("nodelabel needs a WDL net: --wdl <file> (or $CHESS_WDL)");
+        std::process::exit(2);
+    };
+    let shared = Shared::new(flag("--hash", 16) as usize);
+    let limits = Limits { nodes: Some(nodes), ..Default::default() };
+    let f = std::fs::File::open(inp).unwrap_or_else(|e| panic!("{inp}: {e}"));
+    let mut tsv = std::io::BufWriter::new(std::fs::File::create(format!("{outp}.tsv")).unwrap());
+    let mut bin = std::io::BufWriter::new(std::fs::File::create(format!("{outp}.f32")).unwrap());
+    const MAXD: usize = 12;
+    for line in std::io::BufReader::new(f).lines() {
+        let line = line.unwrap();
+        let Some(fen) = line.split('\t').next() else { continue };
+        let Ok(b) = Board::from_fen(fen) else { continue };
+        shared.tt.clear();
+        let mut s = Searcher::new(&shared, ThreadData::new(0), DefaultEval::default(), Params::default());
+        let q = s.qsearch_value(&b);
+        let st = net.cp_from_logits_asym(net.raw(&b), true);
+        let mut v = [f64::NAN; MAXD];
+        let mut cb = |r: &chess::search::SearchResult, _: std::time::Duration, _: usize| {
+            if (1..=MAXD as u32).contains(&r.depth) {
+                v[r.depth as usize - 1] = r.score as f64;
+            }
+        };
+        shared.tt.clear();
+        let r = s.go(&b, &[], &limits, Some(&mut cb));
+        let vs: Vec<String> = v.iter().map(|x| if x.is_nan() { "nan".into() } else { format!("{x}") }).collect();
+        writeln!(
+            tsv,
+            "{line}\t{st}\t{q}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            r.score,
+            r.depth,
+            r.nodes,
+            r.best_move,
+            r.best_move.is_capture() as u8,
+            chess::eval::is_mate_score(r.score) as u8,
+            vs.join("\t")
+        )
+        .unwrap();
+        for x in net.inner(&b) {
+            bin.write_all(&x.to_le_bytes()).unwrap();
+        }
+    }
+    tsv.flush().unwrap();
+    bin.flush().unwrap();
 }
 
 fn eval_fens() {
@@ -819,11 +890,21 @@ fn bench(depth: u32) {
     #[cfg(feature = "hyst")]
     let mut hyst = chess::hyst::Tally::default();
     let mut mix = [0u64; 6];
+    // `--set k=v,...` applies here too, so a dormant flag can be checked to
+    // reach the tree before any game is played on it.
+    let args: Vec<String> = std::env::args().collect();
+    let mut params = Params::default();
+    if let Some(spec) = args.iter().position(|a| a == "--set").and_then(|i| args.get(i + 1)) {
+        if let Err(e) = chess::tune::apply_overrides(&mut params, spec) {
+            eprintln!("{e}");
+            std::process::exit(3);
+        }
+    }
     let t = std::time::Instant::now();
     for fen in BENCH_FENS {
         let b = Board::from_fen(fen).unwrap();
         shared.tt.clear();
-        let mut s = Searcher::new(&shared, ThreadData::new(0), DefaultEval::default(), Params::default());
+        let mut s = Searcher::new(&shared, ThreadData::new(0), DefaultEval::default(), params);
         let r = s.go(&b, &[], &limits, None);
         println!(
             "{:>10} nodes  d{:<2} {:>10}  {}",
@@ -1156,7 +1237,7 @@ fn run_match(args: &[String]) {
     let mut threads_a = 1usize;
     let mut threads_b = 1usize;
     let mut hash_mb = 32usize;
-    let mut book = chess::book::builtin();
+    let mut book = chess::book::default_book();
     let mut pgn = None;
     let mut quiet = false;
     let mut name_a: Option<String> = None;
@@ -1199,9 +1280,14 @@ fn run_match(args: &[String]) {
             "--threads-a" => threads_a = next(i).parse().unwrap_or(threads_a).max(1),
             "--threads-b" => threads_b = next(i).parse().unwrap_or(threads_b).max(1),
             "--hash" => hash_mb = next(i).parse().unwrap_or(hash_mb).max(1),
-            "--book" => match chess::book::load(&next(i)) {
-                Ok(bk) => book = bk,
-                Err(e) => fail(e),
+            "--book" => match next(i).as_str() {
+                // The 43 balanced theory lines, kept as an escape hatch: they
+                // are what every number before LEDGER 112 was measured on.
+                "builtin" => book = chess::book::builtin(),
+                path => match chess::book::load(path) {
+                    Ok(bk) => book = bk,
+                    Err(e) => fail(e),
+                },
             },
             "--pgn" => pgn = Some(next(i)),
             "--name-a" => name_a = Some(next(i)),
@@ -2026,8 +2112,12 @@ fn smp_bench(args: &[String]) {
                 shared.tt.clear();
                 shared.nodes.store(0, std::sync::atomic::Ordering::Relaxed);
                 let t0 = std::time::Instant::now();
+                // Fresh tables every search, like the TT clear above: this
+                // measures threads, not history carry-over.
+                let mut td = Vec::new();
                 let r = chess::search::go_parallel(
                     &shared, &b, &[], &limits, params, t, DefaultEval::default, None,
+                    &mut td,
                 );
                 let el = t0.elapsed().as_secs_f64();
                 let n = shared

@@ -11,7 +11,7 @@ use crate::eval::Evaluator;
 use crate::qeval::DefaultEval;
 use crate::movegen::{generate, GenType};
 use crate::chess_move::MoveList;
-use crate::search::{go_parallel, score_to_uci, Limits, Params, SearchResult, Shared};
+use crate::search::{go_parallel, persist_mode, prepare_td, score_to_uci, Limits, Params, SearchResult, Shared, ThreadData};
 use std::io::{BufRead, Write};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -20,6 +20,38 @@ use std::thread::JoinHandle;
 pub const NAME: &str = "Deinopis";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const AUTHOR: &str = "Luka Debevc";
+
+/// TU-2: `--set k=v,...` (or `$CHESS_SET`) at UCI startup, so a playing
+/// build can run one arm of an SPSA pair without recompiling. Parsed once;
+/// `Engine::new` applies it to the default `Params`. A bad spec fails fast
+/// (exit 2) rather than silently running defaults — a 30k-pair campaign
+/// must not tune nothing because of a typo.
+static STARTUP_PARAMS: std::sync::OnceLock<Params> = std::sync::OnceLock::new();
+
+fn startup_params() -> Params {
+    *STARTUP_PARAMS.get_or_init(|| {
+        let mut spec = std::env::var("CHESS_SET").ok();
+        let args: Vec<String> = std::env::args().collect();
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == "--set" {
+                spec = args.get(i + 1).cloned();
+                i += 1;
+            } else if let Some(v) = args[i].strip_prefix("--set=") {
+                spec = Some(v.to_string());
+            }
+            i += 1;
+        }
+        let mut p = Params::default();
+        if let Some(s) = spec {
+            if let Err(e) = crate::tune::apply_overrides(&mut p, &s) {
+                eprintln!("bad --set '{s}': {e}");
+                std::process::exit(2);
+            }
+        }
+        p
+    })
+}
 
 pub struct Engine {
     pub shared: Arc<Shared>,
@@ -30,7 +62,13 @@ pub struct Engine {
     pub params: Params,
     pub threads: usize,
     hash_mb: usize,
-    worker: Option<JoinHandle<()>>,
+    /// One learned table per thread, reused across moves (FX-1). Empty means
+    /// "not yet sized"; `take_td` sizes and applies the persist mode before
+    /// every search, and the worker thread hands the tables back when it
+    /// finishes, so a table is lost only if a search panics. Cleared on
+    /// `ucinewgame`, like the TT.
+    td: Vec<ThreadData>,
+    worker: Option<JoinHandle<Vec<ThreadData>>>,
     /// The running search has no limit of its own (`go infinite`, or a bare
     /// `go`), so only `stop` ends it.
     open_ended: bool,
@@ -45,9 +83,10 @@ impl Engine {
             shared: Arc::new(Shared::new(64)),
             board: Board::startpos(),
             history: Vec::new(),
-            params: Params::default(),
+            params: startup_params(),
             threads: 1,
             hash_mb: 64,
+            td: Vec::new(),
             worker: None,
             open_ended: false,
             adapt: std::sync::Arc::new(std::sync::Mutex::new(crate::adaptive::AdaptiveState::new(params))),
@@ -89,7 +128,11 @@ impl Engine {
                 self.shared.stop.store(true, Ordering::Relaxed);
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            let _ = h.join();
+            // The finished search hands its learned tables back; only a
+            // panicked search loses them, and the next `take_td` rebuilds.
+            if let Ok(td) = h.join() {
+                self.td = td;
+            }
         }
     }
 
@@ -100,25 +143,44 @@ impl Engine {
         if self.open_ended {
             self.stop();
         } else if let Some(h) = self.worker.take() {
-            let _ = h.join();
+            if let Ok(td) = h.join() {
+                self.td = td;
+            }
         }
+    }
+
+    /// Take the engine's learned tables, sized for `threads` and prepared
+    /// for one more move. Node-limited searches always get fresh tables, so
+    /// `go nodes` (and everything built on it: bench, the tuner, every
+    /// reproducibility check) never sees another search's history. Timed
+    /// searches follow `--persist-hist` (default 1 = persist-all).
+    fn take_td(&mut self, limits: &Limits, threads: usize) -> Vec<ThreadData> {
+        let mut td = std::mem::take(&mut self.td);
+        let mode = if limits.nodes.is_some() { 0 } else { persist_mode() };
+        prepare_td(&mut td, threads, mode);
+        td
     }
 
     /// Run a search on the calling thread and return the result. Used by the
     /// web GUI and terminal play, where there is nothing to do concurrently.
-    pub fn search_blocking(&self, limits: Limits) -> SearchResult {
+    pub fn search_blocking(&mut self, limits: Limits) -> SearchResult {
         self.shared.stop.store(false, Ordering::Relaxed);
         let adapt = self.adapt.clone();
-        go_parallel(
+        let threads = self.search_threads(&limits);
+        let mut td = self.take_td(&limits, threads);
+        let r = go_parallel(
             &self.shared,
             &self.board,
             &self.history,
             &limits,
             self.params,
-            self.search_threads(&limits),
+            threads,
             move || crate::qeval::DefaultEval::with_adaptive(adapt.clone()),
             None,
-        )
+            &mut td,
+        );
+        self.td = td;
+        r
     }
 
     /// Start a search on a worker thread, printing UCI `info` lines as it goes
@@ -139,6 +201,10 @@ impl Engine {
 
         let threads = self.search_threads(&limits);
         let adapt = self.adapt.clone();
+        // `take_td` after `stop`: the previous search (if any) handed its
+        // tables back in `stop`'s join, so these are last move's tables with
+        // this move's start rule applied — or fresh ones at mode 0.
+        let mut td = self.take_td(&limits, threads);
 
         self.worker = Some(std::thread::spawn(move || {
             let mut emit = |r: &SearchResult, el: std::time::Duration, seldepth: usize| {
@@ -176,9 +242,12 @@ impl Engine {
                 threads,
                 move || crate::qeval::DefaultEval::with_adaptive(adapt.clone()),
                 Some(&mut emit),
+                &mut td,
             );
             println!("bestmove {}", res.best_move.to_uci());
             let _ = std::io::stdout().flush();
+            // Hand the learned tables back; `stop`/`finish` reclaims them.
+            td
         }));
     }
 
@@ -342,6 +411,25 @@ pub fn run() {
                         );
                     }
                 }
+                // TU-2: non-default params on the record, so a match log
+                // identifies which arm this engine is.
+                {
+                    let d = Params::default();
+                    let diffs: Vec<String> = Params::all_names()
+                        .iter()
+                        .filter_map(|n| {
+                            let (a, b) = (engine.params.get(n), d.get(n));
+                            if a != b {
+                                a.map(|v| format!("{n}={v}"))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if !diffs.is_empty() {
+                        println!("info string params: {}", diffs.join(","));
+                    }
+                }
                 println!("uciok");
             }
             "isready" => println!("readyok"),
@@ -350,6 +438,9 @@ pub fn run() {
                 engine.shared.tt.clear();
                 engine.board = Board::startpos();
                 engine.history.clear();
+                for t in engine.td.iter_mut() {
+                    t.clear();
+                }
                 if let Ok(mut s) = engine.adapt.lock() { s.clear(); }
             }
             "setoption" => {

@@ -22,6 +22,11 @@ Mechanism for the split: at the same bench depth m2-a2 grows a **+17%
 bigger tree** (255,808 vs 219,127 nodes). Its per-node edge does not convert
 on the clock because it searches more nodes to get there.
 
+**Doubt (2026-09-15, 017 RV-4):** the mechanism above cannot be the
+explanation — an equal-nodes match already charges for a bigger tree. The
+two results differ by ~2.2σ; noise or an nps difference are the candidates.
+The decision below does not depend on it.
+
 ## Decision
 
 - **Ship on the clock: m1-a1 stays the candidate.** Quality-per-node is

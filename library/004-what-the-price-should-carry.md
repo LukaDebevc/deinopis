@@ -147,7 +147,10 @@ Fitted model on `ln|dev|`:
 | material + `\|qsearch − 1k\|` | **0.232** | **0.80** |
 | + move count + spread | 0.235 | 0.81 |
 
-**σ ∝ npm^-0.89 · |qsearch − 1k|^0.18**, capturing ~80% of what is
+**Corrected 2026-09-15 (LEDGER 092): on the NNUE eval the material effect
+is mostly gone — Q5/Q1 0.75 instead of 0.13 — as conclusion 1 below
+predicted. The |shallow − shallow| disagreement term survives (2.06).**
+On PeSTO: **σ ∝ npm^-0.89 · |qsearch − 1k|^0.18**, capturing ~80% of what is
 theoretically capturable. Material alone spans a **7× range in σ** (sd 35 cp in
 heavy middlegames, 438 cp in light endgames).
 

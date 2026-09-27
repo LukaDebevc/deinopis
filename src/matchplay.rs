@@ -23,6 +23,7 @@
 //! measurement in-repo and reproducible.
 
 use crate::board::{Board, START_FEN};
+use crate::book::Opening;
 use crate::chess_move::{Move, MoveList};
 use crate::eval::Score;
 use crate::game::{self, Status};
@@ -131,8 +132,13 @@ impl Default for Adjudication {
         Adjudication {
             resign_score: 900,
             resign_plies: 8,
-            draw_score: 8,
-            draw_plies: 16,
+            // Draw rule tightened 2026-09-17 (LEDGER 099): 8cp/16 plies cut
+            // 1399/3786 endings; simulating 12cp/12 plies on the cp-0005 gate
+            // PGN cuts 3.2% more plies for 1 result flip in 3786. The resign
+            // half stays at 900/8: 500cp would save ~6% of think time but
+            // converts ~3.6% of draws into wins (~4 Elo scale inflation).
+            draw_score: 12,
+            draw_plies: 12,
             draw_after_move: 40,
             max_plies: 600,
         }
@@ -181,7 +187,7 @@ pub struct MatchConfig {
     pub threads_b: usize,
     pub sprt: Option<Sprt>,
     pub pgn: Option<String>,
-    pub book: Vec<Vec<String>>,
+    pub book: Vec<Opening>,
     pub adj: Adjudication,
     pub quiet: bool,
 }
@@ -521,12 +527,26 @@ fn play_game(
     black: &mut Player,
     white_tag: &str,
     black_tag: &str,
-    opening: &[String],
+    opening: &Opening,
     tc: &TimeControl,
     adj: &Adjudication,
     round: u32,
 ) -> GameRecord {
-    let mut board = Board::startpos();
+    // `book::load` already validated the FEN, so this cannot normally fail --
+    // but a caller that built an `Opening` by hand could, and a bad position is
+    // a setup bug rather than a game result, so it is loud either way.
+    let mut board = match Board::from_fen(&opening.start_fen) {
+        Ok(b) => b,
+        Err(e) => {
+            return GameRecord {
+                white_points: 0.5,
+                reason: "bad book position".into(),
+                plies: 0,
+                pgn: String::new(),
+                error: Some(format!("bad book FEN '{}': {e}", opening.start_fen)),
+            }
+        }
+    };
     let mut keys: Vec<u64> = Vec::new();
     let mut moves: Vec<String> = Vec::new();
     let mut comments: Vec<String> = Vec::new();
@@ -534,7 +554,7 @@ fn play_game(
 
     // Replay the opening. A book line that is not legal is a bug in the book,
     // not a game result, so it is loud.
-    for m in opening {
+    for m in &opening.moves {
         let mut list = MoveList::new();
         generate(&board, GenType::All, &mut list);
         match list.find_uci(m) {
@@ -589,7 +609,7 @@ fn play_game(
 
         let stm = board.stm().index();
         let player: &mut Player = if stm == 0 { white } else { black };
-        let thought = match player.think(&board, START_FEN, &moves, &keys, clock, tc) {
+        let thought = match player.think(&board, &opening.start_fen, &moves, &keys, clock, tc) {
             Ok(t) => t,
             Err(e) => {
                 // A broken engine loses the game, and the error is recorded so
@@ -652,6 +672,7 @@ fn play_game(
         tc,
         &sans,
         &comments,
+        opening,
     );
     GameRecord {
         white_points,
@@ -710,6 +731,7 @@ fn write_pgn(
     tc: &TimeControl,
     sans: &[String],
     comments: &[String],
+    opening: &Opening,
 ) -> String {
     let res = if white_points > 0.75 {
         "1-0"
@@ -724,13 +746,32 @@ fn write_pgn(
     s.push_str(&format!("[White \"{white}\"]\n[Black \"{black}\"]\n"));
     s.push_str(&format!("[Result \"{res}\"]\n"));
     s.push_str(&format!("[TimeControl \"{}\"]\n", tc.describe()));
+    // A game that did not start from the initial position is unreadable
+    // without these two: `[SetUp "1"]` says the `[FEN]` tag is authoritative.
+    // Without them every tool replays the moves from the startpos and either
+    // rejects the game or, worse, silently scores a different one.
+    if !opening.from_startpos() {
+        s.push_str(&format!("[FEN \"{}\"]\n[SetUp \"1\"]\n", opening.start_fen));
+    }
     s.push_str(&format!("[Termination \"{reason}\"]\n\n"));
+
+    // Numbering starts at the FEN's own fullmove counter, and when Black is to
+    // move in the start position the first token is `N... move`. Numbering from
+    // 1 regardless is the classic FEN-book PGN bug: the file looks fine and
+    // every move number in it is wrong.
+    let (start_full, black_first) = match Board::from_fen(&opening.start_fen) {
+        Ok(b) => (b.fullmove() as usize, b.stm() == crate::types::Color::Black),
+        Err(_) => (1, false),
+    };
+    let off = usize::from(black_first);
 
     let mut line = String::new();
     for (i, mv) in sans.iter().enumerate() {
         let mut tok = String::new();
-        if i % 2 == 0 {
-            tok.push_str(&format!("{}. ", i / 2 + 1));
+        if (i + off) % 2 == 0 {
+            tok.push_str(&format!("{}. ", start_full + (i + off) / 2));
+        } else if i == 0 {
+            tok.push_str(&format!("{}... ", start_full));
         }
         tok.push_str(mv);
         if let Some(c) = comments.get(i) {
@@ -756,7 +797,7 @@ fn write_pgn(
 
 struct PairJob {
     round: u32,
-    opening: Vec<String>,
+    opening: Opening,
 }
 
 /// PGN White/Black tags for the two arms: explicit names win, otherwise the
@@ -941,6 +982,13 @@ pub fn run(cfg: MatchConfig) -> (MatchStats, Option<SprtVerdict>) {
         );
     } else if cfg.sprt.is_some() {
         println!("SPRT: inconclusive within {} games", cfg.games);
+        // The cap was reached with no decision. This MUST come back as a
+        // verdict, not None: `main` maps None to exit 0 (the no-SPRT case),
+        // and 0 means H1 to `tools/checkpoint.sh` — so returning None here
+        // shipped a bogus checkpoint for an inconclusive gate (2026-09-18,
+        // cp-0006). Latent since introduction; first triggered by a gate
+        // that ran to cap.
+        verdict = Some(SprtVerdict::Continue);
     }
     (stats, verdict)
 }
@@ -1105,6 +1153,41 @@ pub fn stats_from_games(games: &[PgnGame], who: &str) -> Result<MatchStats, Stri
 mod tests {
     use super::*;
 
+    fn pgn_of(start_fen: &str, sans: &[&str]) -> String {
+        let op = Opening { start_fen: start_fen.to_string(), moves: vec![] };
+        let sans: Vec<String> = sans.iter().map(|s| s.to_string()).collect();
+        let comments = vec![String::new(); sans.len()];
+        write_pgn("a", "b", 0.5, "x", 1, &TimeControl::parse("1+0.01").unwrap(),
+                  &sans, &comments, &op)
+    }
+
+    /// A book of FENs writes games that do not start at move 1. Numbering them
+    /// from 1 anyway is the classic FEN-book bug: the file parses, and every
+    /// move number in it is wrong.
+    #[test]
+    fn pgn_numbers_moves_from_the_fen_counters() {
+        // White to move on move 9 -> "9. Nf3 Nc6 10. Bb5"
+        let w = pgn_of("r1bqkb1r/pppp1ppp/2n2n2/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 4 9",
+                       &["Nc3", "Bc5", "Bb5"]);
+        assert!(w.contains("9. Nc3 Bc5 10. Bb5"), "white-to-move numbering wrong:\n{w}");
+        assert!(w.contains("[SetUp \"1\"]"));
+        assert!(w.contains("[FEN \""));
+
+        // Black to move on move 9 -> "9... Nc6 10. Bb5"
+        let b = pgn_of("r1bqkb1r/pppp1ppp/2n2n2/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 4 9",
+                       &["Bc5", "Bb5", "Nd4"]);
+        assert!(b.contains("9... Bc5 10. Bb5 Nd4"), "black-to-move numbering wrong:\n{b}");
+    }
+
+    /// The startpos case must be untouched: no FEN tag, numbering from 1.
+    #[test]
+    fn pgn_from_startpos_has_no_fen_tag() {
+        let p = pgn_of(START_FEN, &["e4", "e5", "Nf3"]);
+        assert!(!p.contains("[FEN"), "startpos game grew a FEN tag:\n{p}");
+        assert!(!p.contains("[SetUp"));
+        assert!(p.contains("1. e4 e5 2. Nf3"), "startpos numbering wrong:\n{p}");
+    }
+
     fn scores(vals: &[(usize, Score)]) -> Vec<(usize, Score)> {
         vals.to_vec()
     }
@@ -1149,6 +1232,34 @@ mod tests {
         // One entry outside the band is enough to keep playing.
         let unsettled = scores(&[(77, 2), (78, -3), (79, 40), (80, 4)]);
         assert_eq!(adjudicate(&unsettled, 80, &adj), None);
+    }
+
+    #[test]
+    fn inconclusive_at_cap_returns_a_verdict() {
+        // 2026-09-18: run() returned None when an SPRT hit the game cap with
+        // no decision; main maps None to exit 0 (the no-SPRT case), and 0
+        // means H1 to tools/checkpoint.sh — which committed, tagged and
+        // pushed a bogus checkpoint (cp-0006) for a +0.9 inconclusive gate.
+        // Zero games exercises exactly the cap branch, with no games played.
+        let cfg = MatchConfig {
+            a: PlayerSpec::Internal { name: "a".into(), params: Params::default() },
+            b: PlayerSpec::Internal { name: "b".into(), params: Params::default() },
+            name_a: None,
+            name_b: None,
+            games: 0,
+            tc: TimeControl::default(),
+            concurrency: 1,
+            hash_mb: 32,
+            threads_a: 1,
+            threads_b: 1,
+            sprt: Some(crate::sprt::Sprt::new(0.0, 5.0)),
+            pgn: None,
+            book: vec![Opening { start_fen: START_FEN.to_string(), moves: vec![] }],
+            adj: Adjudication::default(),
+            quiet: true,
+        };
+        let (_, verdict) = run(cfg);
+        assert_eq!(verdict, Some(SprtVerdict::Continue));
     }
 
     #[test]

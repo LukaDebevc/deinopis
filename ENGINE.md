@@ -102,6 +102,10 @@ budget in whole plies, rounded up.
 - **Reverse futility.** Ahead by more than the rest of the search can
   plausibly lose: `static_eval - 75 * depth >= beta` at depth ≤ 7 →
   return the static eval.
+- **Futility, skip-quiets form** (`fut_max_depth`, off by default): a quiet
+  that cannot reach alpha (`static + 100 * depth <= alpha`) is not searched;
+  every capture still is. The   whole-node return-static twin shares the params
+  and is proxy-killed (084) — this form is not refuted, in SPRT.
 - **Null move.** Passing is a lower bound on any real move (except in
   zugzwang, so: only with non-pawn material, only when already above
   beta, at depth ≥ 3). Reduction `R = 3 + depth / 4` plies; if the
@@ -110,6 +114,10 @@ budget in whole plies, rounded up.
 - **Check extension.** The one place a node gets money *back*: side to
   move in check → budget += 1 ply. Forced lines are cheap and
   catastrophic to judge statically.
+- **Singular extension** (`se_min_depth`, off by default): a hash move whose
+  half-budget verification without it fails low by more than
+  `3 * depth` cp gets an extra ply. Excluded searches store nothing and
+  never nest.
 
 Mate-distance pruning: alpha = max(alpha, mated-in-ply),
 beta = min(beta, mate-in-ply+1); return alpha if crossed.
@@ -138,7 +146,7 @@ stand-pat fail-high (a Lower bound, no move), and the loop result with the
 usual bound. A deep main-search entry survives a quiescence store; a
 main-search store always displaces a quiescence one (`tt.rs` compares
 depths semantically). Bench 243605 → 199091 nodes (−18%), nps +29%;
-Elo pending SPRT. Capped at 64 q-plies, which never binds.
+shipped in `cp-0004`, +61 Elo over `cp-0003`.
 ## Move ordering
 
 TT move first, then captures/promotions by MVV-LVA, then two killers per
@@ -157,6 +165,17 @@ bonus = min(depth^2, 1200)
 good move: h += bonus - h * bonus / 16384      (saturates toward +16384)
 tried quiets that failed: same with -bonus
 ```
+
+Continuation history (on by default since the 094 bundle gate;
+`--no-conth` switches it off) learns on the same events
+keyed by the reply pair: `conth[prev_piece][prev_to][piece][to]`, added to
+plain history for quiet moves. The cheap forms (countermove, piece/to) both
+measured dead; this full form is in SPRT. Quiescence writes `path[ply].mv`
+on descent so the route read is never stale.
+
+In-check evasions can be ordered by SEE instead of killer/history
+(`qevade_see`, off by default): SEE≥0 evasions above history, SEE<0 at the
+bottom. Captures, killers and the TT move keep their slots.
 
 ## Transposition table
 
@@ -190,7 +209,9 @@ nothing. `weight` is the normalised draw mass, or identically 1 with
 and meaningless). A state-dependent `v`-blend was tried first and deleted:
 numerically probed globally incoherent (a 2% drawish position reads +418cp
 while its 18% neighbour reads −418 — min-loss and max-win do not compare
-across the boundary). tanh(100, 1.0) vs plain fixed-400 running 2026-09-10.
+across the boundary). tanh(100, 1.0) lost −64 and flat(100, 1.0) −46 in
+fixed-400 self-play — fighting draws costs ~50+ however it is shaped, so
+the direction is killed; the knobs stay dormant for a future sharpness gate.
 
 Fallback chain when the net file is missing: deep net → quadratic net
 (`quad.nnue`) → PeSTO tables. **A binary that silently falls back plays a
@@ -207,6 +228,9 @@ movegen, make/unmake, hash, ordering, pricing — is ~5% together.
 ```
 allotment = time_left / moves_to_go + 3/4 * increment, capped at time_left / 3
 movetime mode: movetime - 20 ms.   moves_to_go defaults to 30.
+easy move: same best move with a stable score for `easy_stable`
+  consecutive iterations past `easy_depth` → the next iteration starts only
+  below `easy_frac`% of the half-deadline gate (on by default, `easy_stable=2`).
 ```
 
 ## Parallel search: lazy SMP
@@ -253,11 +277,13 @@ screening there is exhausted; the headroom is per-child labels.
 
 ## What is deliberately NOT in here
 
-Singular extensions. Continuation, countermove, or correction history
-(plain side×from×to only). Futility pruning at normal nodes (reverse
-only, plus delta in quiescence). A reduction table (it is the price
+Singular extensions (in SPRT). Continuation history (in SPRT; plain
+side×from×to only before it). Countermove or correction history
+(plain side×from×to only; correction phase 1 measured exactly zero).
+Futility pruning at normal nodes, whole-node return-static form
+(proxy-killed; the skip-quiets form is in SPRT). A reduction table (it is the price
 list now). Tablebases, an opening book of its own, pondering, Chess960.
-Quiescence hash reads. A tuned price list — `c0` alone is worth −2.2 cp
+A tuned price list — `c0` alone is worth −2.2 cp
 untouched, so the list is still largely unfitted. Lazy-SMP and contempt
 Elo numbers. Multi-opponent Elo combination in `chess elo` (hand-combined;
 see the ladder script).

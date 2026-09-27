@@ -35,6 +35,30 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 LADDER="$ROOT/.ladder"
 BIN="${CHESS_BIN:-$ROOT/target/release/chess}"
+
+# The engine picks its eval silently: $CHESS_WDL, else `quad.nnue` beside the
+# binary, else PeSTO -- with only an `info string` to say which. A gauntlet run
+# without $CHESS_WDL therefore measures a stale net and reports it as a rating,
+# and on 2026-09-21 one did: cp-0007 came back 3047 instead of ~3350 because it
+# played an August `quad.nnue`. LEDGER 071/076/088 were all run with $CHESS_WDL
+# exported by hand, which is a convention no file enforced.
+#
+# So resolve it here, the same way tools/checkpoint.sh does: from the one place
+# that names the deployed net, in git, hash-checked.
+if [ -z "${CHESS_WDL:-}" ]; then
+  PIN="$ROOT/publish/net.sha256"
+  if [ -f "$PIN" ]; then
+    read -r PIN_SHA PIN_PATH < "$PIN"
+    if [ -f "$ROOT/$PIN_PATH" ] \
+       && [ "$(sha256sum "$ROOT/$PIN_PATH" | cut -d' ' -f1)" = "$PIN_SHA" ]; then
+      export CHESS_WDL="$ROOT/$PIN_PATH"
+    else
+      echo "publish/net.sha256 names a net that is missing or has the wrong sha" >&2; exit 1
+    fi
+  else
+    echo "no \$CHESS_WDL and no publish/net.sha256 -- refusing to gauntlet on an unnamed eval" >&2; exit 1
+  fi
+fi
 CCRL_URL="https://computerchess.org.uk/ccrl/404/rating_list_all.html"
 
 # key | repo | tag | exact CCRL name | build recipe | binary produced
@@ -48,6 +72,13 @@ ENGINES=(
   "4ku|kz04px/4ku|v5.1|4ku 5.1 64-bit|make|4ku"
   "inanis|Tearth/Inanis|v1.6.0|Inanis 1.6.0 64-bit|cargo|target/release/inanis"
   "simbelmyne|sroelants/simbelmyne|v1.10.0|Simbelmyne 1.10.0 64-bit|cargo|target/release/simbelmyne"
+  # Added 2026-09-21. Every anchor above was BELOW us, so the rating was an
+  # extrapolation off the top of the ladder -- and the implied rating rises with
+  # anchor strength (slope +0.34 on cp-0007), so a ladder of weak anchors
+  # systematically understates. These three bracket us from above. LEDGER 115.
+  "frozenight|MinusKelvin/frozenight|v6.0.0|Frozenight 6.0.0 64-bit|cargo|target/release/frozenight-uci"
+  "stash|mhouppin/stash-bot|v37.0|Stash 37.0 64-bit|stash|src/stash"
+  "marvin|bmdanielsson/marvin-chess|v6.3.0|Marvin 6.3.0 64-bit|make|marvin"
 )
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
@@ -76,6 +107,7 @@ build_one() {
       go)             GOARCH=amd64 GOAMD64=v3 go build -o "$out" blunder/main.go ;;
       bbc)            gcc -O3 -march=native -o "$out" src/bbc_1.1.c -lm ;;
       cinnamon)       ( cd src && make -j4 cinnamon64-modern-AMD >/dev/null 2>&1 ) ;;
+      stash)          ( cd src && make -j4 >/dev/null ) ;;
       *)              echo "no recipe $recipe"; exit 1 ;;
     esac
   ) || { warn "build failed: $key"; return 1; }
@@ -187,7 +219,13 @@ cmd_run() {
   local stamp results
   stamp="$(date +%Y%m%d-%H%M%S)"
   results="$LADDER/gauntlet-$stamp.tsv"
-  echo "# opponent	ccrl_elo	ccrl_err	engine_errors	result_line" > "$results"
+  # A rating whose eval nobody recorded is not reproducible. Print it and
+  # store it, so a gauntlet on the wrong net is visible in its own output.
+  say "eval $(basename "$CHESS_WDL")  sha $(sha256sum "$CHESS_WDL" | cut -c1-16)"
+  {
+    echo "# eval	$CHESS_WDL	$(sha256sum "$CHESS_WDL" | cut -c1-16)"
+    echo "# opponent	ccrl_elo	ccrl_err	engine_errors	result_line"
+  } > "$results"
 
   while IFS=$'\t' read -r key name elo err g date; do
     [ "${key:0:1}" = "#" ] && continue

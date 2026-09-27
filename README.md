@@ -3,9 +3,9 @@
 Named after the net-casting spider, which hunts by throwing a net.
 
 A chess engine in Rust, written from scratch with no dependencies, with a
-neural evaluation trained by its own PyTorch pipeline. It rates **about 3246
-on the CCRL Blitz scale** (±33, 800 games at 10+0.1 against four CCRL-rated
-engines; [ledger 088](library/ledger/088-cp-0004-gauntlet-3246-ccrl-blitz.md)).
+neural evaluation trained by its own PyTorch pipeline. It rates **about 3349
+on the CCRL Blitz scale** (±38, 1400 games at 10+0.1 against seven CCRL-rated
+engines, three of them stronger; [ledger 120](library/ledger/120-cp0009-gauntlet-3349.md)).
 
 > **Work in progress.** This is an active research project. The engine is
 > stable and strong; the research question below is still open.
@@ -26,7 +26,7 @@ This follows on from my bachelor's thesis on machine learning in chess engines
 cargo build --release                    # needs a CPU with AVX2 for full speed
 ./target/release/chess --wdl nets/m1-b1.nnue            # UCI on stdin/stdout
 ./target/release/chess serve --wdl nets/m1-b1.nnue      # web board at http://127.0.0.1:8080
-./target/release/chess bench --wdl nets/m1-b1.nnue      # prints 199091 nodes
+./target/release/chess bench --wdl nets/m1-b1.nnue      # prints 143603 nodes
 ./target/release/chess help                             # every other subcommand
 cargo test --release
 ```
@@ -34,7 +34,7 @@ cargo test --release
 In a GUI (Cute Chess, Arena, Banksia) add the engine with the argument
 `--wdl <path>/nets/m1-b1.nnue`. **Without it the engine silently falls back to
 a hand-written piece-square eval and is several hundred Elo weaker**;
-`chess bench` tells you which one ran (199091 nodes = the net, 233103 = the
+`chess bench` tells you which one ran (143603 nodes = the net, 222192 = the
 fallback). UCI options: `Hash`, `Threads`, `DrawValue`, `Contempt*`.
 
 `chess serve` is also how I watch a search: it streams depth, score, nodes and
@@ -54,7 +54,9 @@ rated. Treat them as "about X on the CCRL Blitz scale": CCRL's own conditions
 | — | 2026-09-07 | win/draw/loss neural eval (a build between `cp-0001` and `cp-0002`) | ~3049 ±46 | [071](library/ledger/071-cp-0002-gauntlet-about-3176-ccrl-blitz.md) |
 | `cp-0002` | 2026-09-08 | i16 accumulator, SEE term in the price | ~3176 ±42 | [071](library/ledger/071-cp-0002-gauntlet-about-3176-ccrl-blitz.md) |
 | `cp-0003` | 2026-09-09 | move ordering split by SEE, better net | ~3199 ±56 | [076](library/ledger/076-cp-0003-gauntlet-about-3199-ccrl-blitz.md) |
-| `cp-0004` | 2026-09-12 | quiescence shares the hash table | **~3246 ±33** | [088](library/ledger/088-cp-0004-gauntlet-3246-ccrl-blitz.md) |
+| `cp-0004` | 2026-09-12 | quiescence shares the hash table | ~3246 ±33 | [088](library/ledger/088-cp-0004-gauntlet-3246-ccrl-blitz.md) |
+| `cp-0007` | 2026-09-21 | persistent histories, pruning retuned, quiescence delta pruning removed | ~3293 ±29 | [115](library/ledger/115-seven-anchor-gauntlet.md) |
+| `cp-0009` | 2026-09-27 | time management: longer hard stop, more time when the best move is unstable | **~3349 ±38** | [120](library/ledger/120-cp0009-gauntlet-3349.md) |
 
 Consecutive gauntlet ratings often overlap. The claim that each version is
 better than the last rests on a head-to-head SPRT, listed in

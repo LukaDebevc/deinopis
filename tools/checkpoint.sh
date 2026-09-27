@@ -51,7 +51,7 @@ MSG=""
 # Nets are gitignored (819 MB of nnue/ is regenerable), so a tag CANNOT rebuild
 # its own eval. The sha256 goes in the tag message instead: a future gate that
 # quietly swapped the net is then visible rather than silent.
-NET="${CHESS_NET:-$ROOT/nnue/nets/gate-3ep-q8.nnue}"
+NET="${CHESS_NET:-}"
 FAST=0
 FIRST=0
 ELO0=0
@@ -100,6 +100,20 @@ restore_baseline() {
 
 if [ "${RESTORE:-0}" = 1 ]; then restore_baseline; exit 0; fi
 [ -n "$MSG" ] || fail "a checkpoint needs a message: -m \"what changed\""
+
+# Unset means: gate with the net we deploy. `publish/net.sha256` is the one
+# place that names it, it is in git, and tools/publish.sh already hash-checks
+# it. A hardcoded default here goes stale in silence -- this one did, and
+# cp-0006 was tagged naming an eval 58 Elo worse than the shipped one.
+if [ -z "$NET" ]; then
+  PIN="$ROOT/publish/net.sha256"
+  [ -f "$PIN" ] || fail "no --net, no \$CHESS_NET, and no $PIN to fall back on."
+  read -r PIN_SHA PIN_PATH < "$PIN"
+  NET="$ROOT/$PIN_PATH"
+  [ -f "$NET" ] || fail "the net pinned in publish/net.sha256 is not on this machine: $NET"
+  [ "$(sha256sum "$NET" | cut -d" " -f1)" = "$PIN_SHA" ] \
+    || fail "$NET does not match the sha pinned in publish/net.sha256."
+fi
 
 [ -f "$NET" ] || fail "no eval net at $NET — pass --net <file>, or CHESS_NET=. \
 A gate with no named net is a gate that measures PeSTO."
